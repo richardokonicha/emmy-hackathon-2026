@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Compile and run every generated variant in dev/cases through submit.py."""
+"""Compile and run every generated variant through submit.py.
+
+Walks both variant directories:
+
+    dev/cases/       shape and op-mix variations of the five categories
+    dev/cases_oops/  the scalar-op coverage pack
+
+Every pack is compiled with compile.py and executed on the hosted runner, then checked
+against its expected.npz within the problem's tolerance. This is the harness the video
+quotes, so the number it prints is the number that is actually verified.
+
+    .venv/bin/python dev/run_extra.py
+"""
 
 from __future__ import annotations
 
@@ -8,13 +20,23 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+CASE_DIRS = [ROOT / "dev" / "cases", ROOT / "dev" / "cases_oops"]
+
+
+def packs():
+    for directory in CASE_DIRS:
+        if not directory.is_dir():
+            continue
+        for problem in sorted(directory.iterdir()):
+            if (problem / "meta.json").exists():
+                yield problem
 
 
 def main() -> int:
     failed = []
-    for problem in sorted((ROOT / "dev" / "cases").iterdir()):
-        if not (problem / "meta.json").exists():
-            continue
+    total = 0
+    for problem in packs():
+        total += 1
         proc = subprocess.run(
             [
                 sys.executable,
@@ -34,7 +56,8 @@ def main() -> int:
         if not ok:
             print(output[-1500:])
             failed.append(problem.name)
-    print(f"\n{'ALL PASS' if not failed else 'FAILED: ' + ', '.join(failed)}")
+    print(f"\n{total - len(failed)}/{total} packs PASS"
+          f"{'' if not failed else ' - FAILED: ' + ', '.join(failed)}")
     return 1 if failed else 0
 
 

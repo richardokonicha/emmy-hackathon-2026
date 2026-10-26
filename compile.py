@@ -379,6 +379,37 @@ class Compiler:
             acc_reg = self.add_int(acc_reg, acc_const)
         return acc_reg
 
+    def _is_multiple_of(self, e, w: int) -> bool:
+        """True if expression ``e`` is provably divisible by ``w``."""
+        if isinstance(e, Literal):
+            try:
+                return int(e.value) % w == 0
+            except (TypeError, ValueError):
+                return False
+        if isinstance(e, BinaryExpr):
+            if e.op in ("+", "-"):
+                return self._is_multiple_of(e.left, w) and self._is_multiple_of(e.right, w)
+            if e.op == "*":
+                return self._is_multiple_of(e.left, w) or self._is_multiple_of(e.right, w)
+        return False
+
+    def _flat_index_aligned(self, name: str, index, w: int) -> bool:
+        """True if the flat element index of ``index`` is provably 0 (mod ``w``)."""
+        shape = self.shape_of(name)
+        strides = [1] * len(shape)
+        for i in range(len(shape) - 2, -1, -1):
+            strides[i] = strides[i + 1] * int(shape[i + 1])
+        for idx, stride in zip(index, strides):
+            if int(stride) % w != 0 and not self._is_multiple_of(idx, w):
+                return False
+        return True
+
+    def _size_divisible(self, name: str, w: int) -> bool:
+        n = 1
+        for e in self.shape_of(name):
+            n *= int(e)
+        return n % w == 0
+
     def global_addr(self, name: str, flat: str) -> str:
         if name not in self.base:
             raise SystemExit(f"no pointer parameter for buffer {name!r}")
@@ -1093,6 +1124,22 @@ class Compiler:
             raise SystemExit(f"Load without input: {s!r}")
         dtype = dtype_name(s.dtype) if s.dtype is not None else dtype_name(self.dtype_of(input_name))
         index = tuple(s.index or ())
+        w = len(names)
+        if (
+            w in (2, 4)
+            and input_name not in self.smem
+            and dtype == "f32"
+            and self._flat_index_aligned(input_name, index, w)
+            and self._size_divisible(input_name, w)
+        ):
+            flat = self.flatten(input_name, index)
+            addr = self.global_addr(input_name, flat)
+            regs = [self.emitter.regs.new("f") for _ in names]
+            self.emitter.ins(f"ld.global.v{w}.{dtype} {{{', '.join(regs)}}}, [{addr}];")
+            for name, reg in zip(names, regs):
+                self.values[name] = reg
+                self.value_dtypes[name] = dtype
+            return
         for k, name in enumerate(names):
             if name is None:
                 continue
@@ -1147,6 +1194,21 @@ class Compiler:
             raise SystemExit(f"Write without output: {s!r}")
         dtype = dtype_name(s.value_dtype) if s.value_dtype is not None else dtype_name(self.dtype_of(output))
         index = tuple(s.index or ())
+        w = len(values)
+        if (
+            w in (2, 4)
+            and not s.atomic
+            and output not in self.smem
+            and dtype == "f32"
+            and all(n in self.value_dtypes and self.value_dtypes[n] == "f32" for n in values)
+            and self._flat_index_aligned(output, index, w)
+            and self._size_divisible(output, w)
+        ):
+            flat = self.flatten(output, index)
+            addr = self.global_addr(output, flat)
+            regs = [self.values[n] for n in values]
+            self.emitter.ins(f"st.global.v{w}.{dtype} [{addr}], {{{', '.join(regs)}}};")
+            return
         for k, name in enumerate(values):
             if name is None:
                 continue

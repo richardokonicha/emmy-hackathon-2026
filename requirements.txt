@@ -1,0 +1,6 @@
+# The compiler itself needs only Emmy's IR reader (plus the standard library).
+emmy-ml==0.3.11
+
+# Only for submit.py and the dev/ harness (numpy arrays, runner HTTP calls).
+numpy
+requests

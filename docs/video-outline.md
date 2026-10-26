@@ -61,10 +61,10 @@ Prep before recording:
   expected.npz. All fifteen pass; hidden eval runs your compiler the same way."
 
 ## 3:10-3:50 Hardening against the hidden set
-- On screen: `dev/run_extra.py` last-page output (ALL PASS over 27 cases).
+- On screen: `dev/run_extra.py` last-page output (35/35 packs PASS).
 - Say: "The hidden set is the same categories with different shapes and ops. I
   couldn't run torch.compile on this Mac, so I ported the generator inside a
-  small Ubuntu VM, generated 27 kernel variants by tracing new torch expressions
+  small Ubuntu VM, generated 35 kernel variants by tracing new torch expressions
   that stress odd shapes - 257, 33x777, 8x8 attention, layernorm - and used those
   packs to fuzz my compiler. It caught three real bugs I never would have found
   with the open set alone:
@@ -77,7 +77,7 @@ Prep before recording:
 - On screen: `git log --oneline`
 - Say: "Every artifact in this repo is committed incrementally: the design doc,
   a plan, then code, then hardening. The compiler passes fifteen open problems
-  and twenty-seven unseen-shape variants; the whole submission is compile.py."
+  and thirty-five unseen-shape variants; the whole submission is compile.py."
 
 ---
 
