@@ -33,6 +33,7 @@ from emmy.compiler.ir.kernel.ir import (
     CpAsyncWait,
     KernelOp,
     Smem,
+    SetMaxNReg,
     Sync,
     TreeHalve,
     WarpShuffle,
@@ -184,9 +185,20 @@ class Compiler:
 
     def _find_meta(self) -> dict:
         meta_path = self.ir_path.with_name("meta.json")
-        if not meta_path.exists():
-            return {"kernels": [{"entry": self.kernel.name, "arg_order": list(self.kernel.inputs) + list(self.kernel.outputs), "args": []}]}
-        return json.loads(meta_path.read_text())
+        if meta_path.exists():
+            return json.loads(meta_path.read_text())
+        # Walk up the directory tree so kernels shipped without a sibling
+        # meta.json are still discoverable; fail loudly if none exists so a
+        # missing meta never silently produces wrong argument order.
+        candidate = self.ir_path.parent
+        for ancestor in [candidate, *candidate.parents]:
+            meta_path = ancestor / "meta.json"
+            if meta_path.exists():
+                return json.loads(meta_path.read_text())
+        raise SystemExit(
+            f"no meta.json found for {self.ir_path} (searched {self.ir_path.parent} "
+            f"and ancestors) - argument order and entry name cannot be determined"
+        )
 
     def _kernel_meta(self) -> dict:
         for k in self.meta.get("kernels", []):
@@ -983,6 +995,7 @@ class Compiler:
             "CpAsyncCopy": self.stmt_cp_async,
             "CpAsyncCommit": self.stmt_cp_commit,
             "CpAsyncWait": self.stmt_cp_wait,
+            "SetMaxNReg": self.stmt_setmaxnreg,
             "Select": self.stmt_select,
             "ZeroPrologue": self.stmt_zero_prologue,
         }.get(type(s).__name__)
@@ -1250,10 +1263,14 @@ class Compiler:
         self.stmt(s.else_body)
         self.emitter.raw(end + ":")
 
-    def seed_accums(self, body):
+    def seed_accums(self, body, loop_axis: str | None = None):
         seen = set()
         for st in body:
             if isinstance(st, Accum) and st.name not in seen:
+                # Axis-driven: only seed accumulators whose axes reduce over
+                # the enclosing loop axis (or are scalar/axis-less).
+                if loop_axis is not None and st.axes and loop_axis not in st.axes:
+                    continue
                 seen.add(st.name)
                 dtype = dtype_name(st.dtype) if st.dtype is not None else "f32"
                 identity = st.op.identity
@@ -1271,21 +1288,29 @@ class Compiler:
             raise SystemExit(f"dynamic loop axis {s.axis.name!r} is unsupported")
         extent = int(s.axis.extent.as_static())
         if s.seed:
-            self.seed_accums(s.body)
-        counter = self.int_reg(0)
-        head = self.emitter.label("LOOP")
-        tail = self.emitter.label("LOOP_END")
-        self.emitter.raw(head + ":")
-        p = self.emitter.regs.new("p")
-        self.emitter.ins(f"setp.ge.s32 {p}, {counter}, {extent};")
-        self.emitter.ins(f"@{p} bra {tail};")
+            self.seed_accums(s.body, loop_axis=s.axis.name)
         old = self.values.get(s.axis.name)
-        self.values[s.axis.name] = counter
         self.value_dtypes[s.axis.name] = "s32"
-        self.stmt(s.body)
-        self.emitter.ins(f"add.s32 {counter}, {counter}, 1;")
-        self.emitter.ins(f"bra {head};")
-        self.emitter.raw(tail + ":")
+        if s.unroll:
+            # Fully unroll a static trip-count loop: emit the body once per
+            # iteration with the axis bound to a constant, removing branch
+            # and counter overhead.
+            for i in range(extent):
+                self.values[s.axis.name] = self.int_reg(i)
+                self.stmt(s.body)
+        else:
+            counter = self.int_reg(0)
+            head = self.emitter.label("LOOP")
+            tail = self.emitter.label("LOOP_END")
+            self.emitter.raw(head + ":")
+            p = self.emitter.regs.new("p")
+            self.emitter.ins(f"setp.ge.s32 {p}, {counter}, {extent};")
+            self.emitter.ins(f"@{p} bra {tail};")
+            self.values[s.axis.name] = counter
+            self.stmt(s.body)
+            self.emitter.ins(f"add.s32 {counter}, {counter}, 1;")
+            self.emitter.ins(f"bra {head};")
+            self.emitter.raw(tail + ":")
         if old is not None:
             self.values[s.axis.name] = old
         else:
@@ -1293,8 +1318,10 @@ class Compiler:
             self.value_dtypes.pop(s.axis.name, None)
 
     def stmt_strided_loop(self, s):
+        loop_axis = getattr(s, "axis", None)
+        loop_axis = loop_axis.name if loop_axis is not None else None
         if s.seed:
-            self.seed_accums(s.body)
+            self.seed_accums(s.body, loop_axis=loop_axis)
         start, _ = self.expr(s.start)
         counter = self.emitter.regs.new("r")
         self.emitter.ins(f"mov.s32 {counter}, {start};")
@@ -1451,6 +1478,10 @@ class Compiler:
 
     def stmt_cp_wait(self, s):
         self.emitter.ins(f"cp.async.wait_group {int(s.group)};")
+
+    def stmt_setmaxnreg(self, s):
+        direction = str(s.direction)
+        self.emitter.ins(f"setmaxnreg.{direction}.sync.aligned.u32 {int(s.count)};")
 
     def stmt_select(self, s):
         branches = list(s.branches)
