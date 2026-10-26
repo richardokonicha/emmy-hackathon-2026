@@ -1258,17 +1258,20 @@ class Compiler:
         dtype = dtype_name(s.dtype) if s.dtype is not None else dtype_name(self.dtype_of(input_name))
         index = tuple(s.index or ())
         w = len(names)
+        aligned = self._flat_index_aligned(input_name, index, w) and self._size_divisible(input_name, w)
         if (
             w in (2, 4)
-            and input_name not in self.smem
             and dtype == "f32"
-            and self._flat_index_aligned(input_name, index, w)
-            and self._size_divisible(input_name, w)
+            and aligned
         ):
             flat = self.flatten(input_name, index)
-            addr = self.global_addr(input_name, flat)
             regs = [self.emitter.regs.new("f") for _ in names]
-            self.emitter.ins(f"ld.global.v{w}.{dtype} {{{', '.join(regs)}}}, [{addr}];")
+            if input_name in self.smem:
+                addr = self.smem_elem_addr(input_name, flat)
+                self.emitter.ins(f"ld.shared.v{w}.{dtype} {{{', '.join(regs)}}}, [{addr}];")
+            else:
+                addr = self.global_addr(input_name, flat)
+                self.emitter.ins(f"ld.global.v{w}.{dtype} {{{', '.join(regs)}}}, [{addr}];")
             for name, reg in zip(names, regs):
                 self.values[name] = reg
                 self.value_dtypes[name] = dtype
@@ -1328,19 +1331,22 @@ class Compiler:
         dtype = dtype_name(s.value_dtype) if s.value_dtype is not None else dtype_name(self.dtype_of(output))
         index = tuple(s.index or ())
         w = len(values)
+        aligned = self._flat_index_aligned(output, index, w) and self._size_divisible(output, w)
         if (
             w in (2, 4)
             and not s.atomic
-            and output not in self.smem
             and dtype == "f32"
             and all(n in self.value_dtypes and self.value_dtypes[n] == "f32" for n in values)
-            and self._flat_index_aligned(output, index, w)
-            and self._size_divisible(output, w)
+            and aligned
         ):
             flat = self.flatten(output, index)
-            addr = self.global_addr(output, flat)
             regs = [self.values[n] for n in values]
-            self.emitter.ins(f"st.global.v{w}.{dtype} [{addr}], {{{', '.join(regs)}}};")
+            if output in self.smem:
+                addr = self.smem_elem_addr(output, flat)
+                self.emitter.ins(f"st.shared.v{w}.{dtype} [{addr}], {{{', '.join(regs)}}};")
+            else:
+                addr = self.global_addr(output, flat)
+                self.emitter.ins(f"st.global.v{w}.{dtype} [{addr}], {{{', '.join(regs)}}};")
             return
         for k, name in enumerate(values):
             if name is None:
