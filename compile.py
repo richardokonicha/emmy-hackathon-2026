@@ -126,6 +126,10 @@ def float_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
+def float16_bits(value: float) -> int:
+    return struct.unpack("<H", struct.pack("<e", float(value)))[0]
+
+
 def float64_bits(value: float) -> int:
     return struct.unpack("<Q", struct.pack("<d", float(value)))[0]
 
@@ -183,8 +187,8 @@ class Compiler:
         self.graph = Graph.from_dict(self.raw)
         self.kernel = self._find_kernel()
         self.meta = self._find_meta()
-        self.entry = self.kernel.name or self._kernel_meta()["entry"]
         self.kmeta = self._kernel_meta()
+        self.entry = self.kernel.name or self.kmeta.get("entry", self.kernel.name)
 
         self.tensors: dict[str, dict] = {}
         for node in self.raw.get("nodes", {}).values():
@@ -196,7 +200,7 @@ class Compiler:
                 {"name": arg["name"], "shape": arg.get("shape", []), "dtype": arg.get("dtype", "f32")},
             )
 
-        self.arg_order = list(self.kmeta["arg_order"])
+        self.arg_order = list(self.kmeta.get("arg_order") or (list(self.kernel.inputs) + list(self.kernel.outputs)))
         self.args = {a["name"]: a for a in self.kmeta.get("args", [])}
 
         self.emitter = Emitter()
@@ -236,10 +240,13 @@ class Compiler:
         )
 
     def _kernel_meta(self) -> dict:
-        for k in self.meta.get("kernels", []):
+        kernels = self.meta.get("kernels")
+        if not isinstance(kernels, list) or not kernels:
+            raise SystemExit("meta.json has no kernels")
+        for k in kernels:
             if k.get("entry") == self.kernel.name:
                 return k
-        return self.meta["kernels"][0]
+        return kernels[0]
 
     def shape_of(self, name: str):
         if name in self.smem:
@@ -357,7 +364,7 @@ class Compiler:
         elif name == "f64":
             self.emitter.ins(f"mov.f64 {reg}, 0x{float64_bits(value):016X};")
         elif name == "f16":
-            self.emitter.ins(f"mov.b16 {reg}, 0x{float_bits(value):04X};")
+            self.emitter.ins(f"mov.b16 {reg}, 0x{float16_bits(value):04X};")
         else:
             reg = self.int_reg(int(value))
             return reg
@@ -505,7 +512,7 @@ class Compiler:
             return reg, "f64"
         if name == "f16":
             reg = self.emitter.regs.new("h")
-            self.emitter.ins(f"mov.b16 {reg}, 0x{float_bits(float(value)):04X};")
+            self.emitter.ins(f"mov.b16 {reg}, 0x{float16_bits(float(value)):04X};")
             return reg, "f16"
         reg = self.emitter.regs.new("f")
         self.emitter.ins(f"mov.f32 {reg}, 0f{float_bits(value):08X};")
@@ -1645,7 +1652,7 @@ class Compiler:
             self.special["threadIdx.x"] = tid
         ntid = self.emitter.regs.new("r")
         self.emitter.ins(f"mov.u32 {ntid}, %ntid.x;")
-        base = self.global_addr(dst, (0,))[0]
+        base = self.global_addr(dst, (0,))
         wreg = self.emitter.regs.new("r")
         self.emitter.ins(f"mov.u32 {wreg}, {tid};")
         loop = self.emitter.label("ZPRO_LOOP")
