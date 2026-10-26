@@ -7,3 +7,10 @@ __pycache__/
 hidden/
 hidden_full/
 expressions_hidden.py
+
+# internal / reviewer-facing artifacts not for public submission
+AUDIT_REPORT.md
+docs/ORGANIZERS-README.md
+docs/plans/2026-10-26-hardening-plan.md
+docs/video-script.md
+docs/video-outline.md
