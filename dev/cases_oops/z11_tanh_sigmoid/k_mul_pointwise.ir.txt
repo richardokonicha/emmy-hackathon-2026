@@ -1,0 +1,12 @@
+    Tile[a0] (N=100)
+        in0__u0 = load x0[((a0 * 2) + 0)]
+        f32 v0__u0 = tanh(in0__u0)
+        in1__u0 = load x1[((a0 * 2) + 0)]
+        f32 v1__u0 = sigmoid(in1__u0)
+        f32 v2__u0 = multiply(v0__u0, v1__u0)
+        in0__u1 = load x0[((a0 * 2) + 1)]
+        f32 v0__u1 = tanh(in0__u1)
+        in1__u1 = load x1[((a0 * 2) + 1)]
+        f32 v1__u1 = sigmoid(in1__u1)
+        f32 v2__u1 = multiply(v0__u1, v1__u1)
+        mul[((a0 * 2) + 0)] = (v2__u0, v2__u1)

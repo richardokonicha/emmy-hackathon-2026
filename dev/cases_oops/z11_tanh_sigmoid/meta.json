@@ -1,0 +1,63 @@
+{
+ "id": "z11_tanh_sigmoid",
+ "code": "torch.tanh(torch.randn(200)) * torch.sigmoid(torch.randn(200))",
+ "rtol": 1e-05,
+ "atol": 1e-06,
+ "graph_inputs": [
+  "x0",
+  "x1"
+ ],
+ "graph_outputs": [
+  "mul"
+ ],
+ "kernels": [
+  {
+   "node": "mul",
+   "entry": "k_mul_pointwise",
+   "arg_order": [
+    "x1",
+    "x0",
+    "mul"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x1",
+     "dtype": "f32",
+     "shape": [
+      200
+     ],
+     "seed": 1
+    },
+    {
+     "name": "x0",
+     "dtype": "f32",
+     "shape": [
+      200
+     ],
+     "seed": 0
+    },
+    {
+     "name": "mul",
+     "dtype": "f32",
+     "shape": [
+      200
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

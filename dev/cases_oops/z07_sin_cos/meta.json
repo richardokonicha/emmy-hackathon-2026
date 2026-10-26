@@ -1,0 +1,63 @@
+{
+ "id": "z07_sin_cos",
+ "code": "torch.sin(torch.randn(128)) * torch.cos(torch.randn(128))",
+ "rtol": 0.0001,
+ "atol": 0.0001,
+ "graph_inputs": [
+  "x0",
+  "x1"
+ ],
+ "graph_outputs": [
+  "mul"
+ ],
+ "kernels": [
+  {
+   "node": "mul",
+   "entry": "k_mul_pointwise",
+   "arg_order": [
+    "x1",
+    "x0",
+    "mul"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x1",
+     "dtype": "f32",
+     "shape": [
+      128
+     ],
+     "seed": 1
+    },
+    {
+     "name": "x0",
+     "dtype": "f32",
+     "shape": [
+      128
+     ],
+     "seed": 0
+    },
+    {
+     "name": "mul",
+     "dtype": "f32",
+     "shape": [
+      128
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

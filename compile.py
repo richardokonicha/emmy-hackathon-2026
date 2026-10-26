@@ -572,6 +572,86 @@ class Compiler:
     # ------------------------------------------------------------------
     # elementwise ops
     # ------------------------------------------------------------------
+    def _emit_exp_f32(self, y):
+        # exp(y) = 2^(y * log2 e)
+        t = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {t}, {y}, 0f{float_bits(1.4426950408889634):08X};")
+        out = self.emitter.regs.new("f")
+        self.emitter.ins(f"ex2.approx.f32 {out}, {t};")
+        return out
+
+    def _emit_lg2_f32(self, x):
+        out = self.emitter.regs.new("f")
+        self.emitter.ins(f"lg2.approx.f32 {out}, {x};")
+        return out
+
+    def emit_tanh_f32(self, x):
+        # tanh(x) = sign(x) * (1 - e) / (1 + e),  e = 2^(-2*log2(e)*|x|) = exp(-2|x|)
+        ax = self.emitter.regs.new("f")
+        self.emitter.ins(f"abs.f32 {ax}, {x};")
+        y = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {y}, {ax}, 0f{float_bits(-2.8853900817779268):08X};")
+        ex = self.emitter.regs.new("f")
+        self.emitter.ins(f"ex2.approx.f32 {ex}, {y};")
+        negex = self.emitter.regs.new("f")
+        self.emitter.ins(f"neg.f32 {negex}, {ex};")
+        num = self.emitter.regs.new("f")
+        self.emitter.ins(f"add.f32 {num}, {negex}, 0f3F800000;")
+        den = self.emitter.regs.new("f")
+        self.emitter.ins(f"add.f32 {den}, {ex}, 0f3F800000;")
+        ratio = self.emitter.regs.new("f")
+        self.emitter.ins(f"div.rn.f32 {ratio}, {num}, {den};")
+        p = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.lt.f32 {p}, {x}, 0f00000000;")
+        sign = self.emitter.regs.new("f")
+        self.emitter.ins(f"mov.f32 {sign}, 0f3F800000;")
+        self.emitter.ins(f"@{p} mov.f32 {sign}, 0fBF800000;")
+        out = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {out}, {ratio}, {sign};")
+        return out
+
+    def emit_erf_f32(self, t):
+        # Abramowitz & Stegun 7.1.26 (max abs error 1.5e-7):
+        #   A = 1 / (1 + 0.3275911 * |t|);  erf(t) = sgn(t) * (1 - (u * e))
+        #   with u the degree-5 Horner polynomial in A.
+        a = self.emitter.regs.new("f")
+        self.emitter.ins(f"abs.f32 {a}, {t};")
+        y = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {y}, {a}, {a};")
+        ey = self.emitter.regs.new("f")
+        self.emitter.ins(f"neg.f32 {ey}, {y};")
+        ex = self._emit_exp_f32(ey)
+        tau = self.emitter.regs.new("f")
+        self.emitter.ins(f"fma.rn.f32 {tau}, {a}, 0f{float_bits(0.3275911):08X}, 0f3F800000;")
+        iv = self.emitter.regs.new("f")
+        self.emitter.ins(f"rcp.rn.f32 {iv}, {tau};")
+        C5, C4 = 1.061405429, -1.453152027
+        C3, C2, C1 = 1.421413741, -0.284496736, 0.254829592
+        h = self.emitter.regs.new("f")
+        self.emitter.ins(f"fma.rn.f32 {h}, 0f{float_bits(C5):08X}, {iv}, 0f{float_bits(C4):08X};")
+        h2 = self.emitter.regs.new("f")
+        self.emitter.ins(f"fma.rn.f32 {h2}, {h}, {iv}, 0f{float_bits(C3):08X};")
+        h3 = self.emitter.regs.new("f")
+        self.emitter.ins(f"fma.rn.f32 {h3}, {h2}, {iv}, 0f{float_bits(C2):08X};")
+        h4 = self.emitter.regs.new("f")
+        self.emitter.ins(f"fma.rn.f32 {h4}, {h3}, {iv}, 0f{float_bits(C1):08X};")
+        h5 = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {h5}, {h4}, {iv};")
+        tail = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {tail}, {h5}, {ex};")
+        negt = self.emitter.regs.new("f")
+        self.emitter.ins(f"neg.f32 {negt}, {tail};")
+        pos = self.emitter.regs.new("f")
+        self.emitter.ins(f"add.f32 {pos}, {negt}, 0f3F800000;")
+        p = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.lt.f32 {p}, {t}, 0f00000000;")
+        negp = self.emitter.regs.new("f")
+        self.emitter.ins(f"neg.f32 {negp}, {pos};")
+        out = self.emitter.regs.new("f")
+        self.emitter.ins(f"mov.f32 {out}, {pos};")
+        self.emitter.ins(f"@{p} mov.f32 {out}, {negp};")
+        return out
+
     def op_on_regs(self, op, args, dtype="f32", dest=None, arg_dtypes=None):
         name = getattr(op, "name", str(op))
         dt = dtype_name(dtype)
@@ -639,6 +719,60 @@ class Compiler:
             self.emitter.ins(f"ex2.approx.f32 {out}, {t};")
             return out, "f32"
 
+        if name == "sign":
+            x = args[0]
+            pg = self.emitter.regs.new("p")
+            self.emitter.ins(f"setp.gt.f32 {pg}, {x}, 0f00000000;")
+            pl = self.emitter.regs.new("p")
+            self.emitter.ins(f"setp.lt.f32 {pl}, {x}, 0f00000000;")
+            out = self.emitter.regs.new("f")
+            self.emitter.ins(f"mov.f32 {out}, 0f00000000;")
+            self.emitter.ins(f"@{pg} mov.f32 {out}, 0f3F800000;")
+            self.emitter.ins(f"@{pl} mov.f32 {out}, 0fBF800000;")
+            return out, "f32"
+
+        if name in ("log", "log2", "log10"):
+            l2 = self._emit_lg2_f32(args[0])
+            if name == "log2":
+                return l2, "f32"
+            out = self.emitter.regs.new("f")
+            scale = 0.6931471805599453 if name == "log" else 0.3010299956639812
+            self.emitter.ins(f"mul.f32 {out}, {l2}, 0f{float_bits(scale):08X};")
+            return out, "f32"
+
+        if name == "softplus":
+            x = args[0]
+            e = self._emit_exp_f32(x)
+            s = self.emitter.regs.new("f")
+            self.emitter.ins(f"add.f32 {s}, {e}, 0f3F800000;")
+            l2 = self._emit_lg2_f32(s)
+            out = self.emitter.regs.new("f")
+            self.emitter.ins(f"mul.f32 {out}, {l2}, 0f{float_bits(0.6931471805599453):08X};")
+            return out, "f32"
+
+        if name in ("sin", "cos", "tan"):
+            if name == "tan":
+                s = self.emitter.regs.new("f")
+                self.emitter.ins(f"sin.approx.f32 {s}, {args[0]};")
+                c = self.emitter.regs.new("f")
+                self.emitter.ins(f"cos.approx.f32 {c}, {args[0]};")
+                out = self.emitter.regs.new("f")
+                self.emitter.ins(f"div.rn.f32 {out}, {s}, {c};")
+                return out, "f32"
+            out = self.emitter.regs.new("f")
+            op = "sin" if name == "sin" else "cos"
+            self.emitter.ins(f"{op}.approx.f32 {out}, {args[0]};")
+            return out, "f32"
+
+        if name == "pow":
+            x, y = args
+            base = self._emit_lg2_f32(x)
+            p = self.emitter.regs.new("f")
+            self.emitter.ins(f"mul.f32 {p}, {base}, {y};")
+            out = self.emitter.regs.new("f")
+            self.emitter.ins(f"ex2.approx.f32 {out}, {p};")
+            return out, "f32"
+
         if name == "relu":
             out = self.emitter.regs.new("f")
             self.emitter.ins(f"max.f32 {out}, {args[0]}, 0f00000000;")
@@ -663,9 +797,39 @@ class Compiler:
             return out, "f32"
 
         if name == "tanh":
-            out = self.emitter.regs.new("f")
-            self.emitter.ins(f"tanh.approx.f32 {out}, {args[0]};")
-            return out, "f32"
+            return self.emit_tanh_f32(args[0]), "f32"
+
+        if name in ("erf", "gelu", "gelu_tanh"):
+            x = args[0]
+            if name == "gelu_tanh":
+                x3 = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {x3}, {x}, {x};")
+                self.emitter.ins(f"mul.f32 {x3}, {x3}, {x};")
+                inner = self.emitter.regs.new("f")
+                self.emitter.ins(f"fma.rn.f32 {inner}, {x3}, 0f{float_bits(0.044715):08X}, {x};")
+                s = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {s}, {inner}, 0f{float_bits(0.7978845608028654):08X};")
+                th = self.emit_tanh_f32(s)
+                u = self.emitter.regs.new("f")
+                self.emitter.ins(f"add.f32 {u}, {th}, 0f3F800000;")
+                halfx = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {halfx}, {x}, 0f3F000000;")
+                out = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {out}, {halfx}, {u};")
+                return out, "f32"
+            if name == "gelu":
+                inner = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {inner}, {x}, 0f{float_bits(0.7071067811865476):08X};")
+                e = self.emit_erf_f32(inner)
+                one = self.emitter.regs.new("f")
+                self.emitter.ins(f"add.f32 {one}, {e}, 0f3F800000;")
+                half = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {half}, 0f3F000000, {one};")
+                out = self.emitter.regs.new("f")
+                self.emitter.ins(f"mul.f32 {out}, {half}, {x};")
+                return out, "f32"
+            e = self.emit_erf_f32(x)
+            return e, "f32"
 
         if name == "reciprocal":
             out = self.emitter.regs.new("f")
@@ -712,13 +876,19 @@ class Compiler:
         if is_float(dt):
             ptxop = {
                 "add": "add.f32",
+                "sum": "add.f32",
                 "subtract": "sub.f32",
+                "sub": "sub.f32",
                 "multiply": "mul.f32",
+                "prod": "mul.f32",
                 "divide": "div.rn.f32",
+                "true_divide": "div.rn.f32",
                 "maximum": "max.f32",
                 "minimum": "min.f32",
                 "max": "max.f32",
                 "min": "min.f32",
+                "amax": "max.f32",
+                "amin": "min.f32",
             }.get(name)
             if ptxop is None:
                 raise SystemExit(f"unsupported float op {name!r}")
@@ -728,13 +898,22 @@ class Compiler:
 
         ptxop = {
             "add": "add.s32",
+            "sum": "add.s32",
             "subtract": "sub.s32",
+            "sub": "sub.s32",
             "multiply": "mul.lo.s32",
+            "prod": "mul.lo.s32",
             "divide": "div.s32",
+            "true_divide": "div.s32",
+            "floor_divide": "div.s32",
+            "remainder": "rem.s32",
+            "mod": "rem.s32",
             "maximum": "max.s32",
             "minimum": "min.s32",
             "max": "max.s32",
             "min": "min.s32",
+            "amax": "max.s32",
+            "amin": "min.s32",
             "and": "and.b32",
             "or": "or.b32",
             "xor": "xor.b32",
