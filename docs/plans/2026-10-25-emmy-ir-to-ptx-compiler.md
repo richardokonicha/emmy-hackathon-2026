@@ -662,7 +662,7 @@ git add compile.py && git commit -m "feat: pass p00 scalar add"
 **Steps:**
 
 ```bash
-for p in p01_vector_add p02_bias_relu p03_saxpy_scale; do
+for p in p01_vector_add p02_scale_shift p03_relu_mul; do
   .venv/bin/python submit.py "$p" --compiler compile.py
 done
 ```
@@ -1062,7 +1062,7 @@ git add compile.py && git commit -m "feat: lower conditionals and selects"
 **Steps:**
 
 ```bash
-for p in r01_array_sum r02_max_reduce r03_rms_norm r04_softmax; do
+for p in r01_array_sum r02_big_sum r03_mean r04_row_sum; do
   .venv/bin/python submit.py "$p" --compiler compile.py
 done
 ```
@@ -1217,7 +1217,7 @@ git add compile.py && git commit -m "feat: pass matmul kernels"
 2. Ensure `WarpShuffle` and `TreeHalve` handle multiple `(state, state_b)` pairs (already generic).
 3. Run:
 ```bash
-for p in f01_bias_gelu f02_layer_norm f03_residual_rms; do
+for p in f01_rmsnorm f02_row_softmax f03_l2norm; do
   .venv/bin/python submit.py "$p" --compiler compile.py
 done
 ```
