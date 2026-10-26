@@ -720,6 +720,7 @@ class Compiler:
             "CpAsyncCommit": self.stmt_cp_commit,
             "CpAsyncWait": self.stmt_cp_wait,
             "Select": self.stmt_select,
+            "ZeroPrologue": self.stmt_zero_prologue,
         }.get(type(s).__name__)
         if method is None:
             raise SystemExit(f"unsupported statement {type(s).__name__}: {s!r}")
@@ -766,9 +767,75 @@ class Compiler:
         strides = [1] * len(extents)
         for i in range(len(extents) - 2, -1, -1):
             strides[i] = strides[i + 1] * extents[i + 1]
+
+        raster = None
+        if s.raster_group and s.raster_axes:
+            names = [a.name for a in s.axes]
+            if s.raster_axes[0] in names and s.raster_axes[1] in names:
+                mi, ni = names.index(s.raster_axes[0]), names.index(s.raster_axes[1])
+                if ni == mi + 1:
+                    gi, oi = (mi, ni) if s.raster_orient == "m" else (ni, mi)
+                    g = min(int(s.raster_group), extents[gi])
+                    if extents[gi] > 1 and g > 1:
+                        raster = (gi, oi, g)
+
+        if raster is not None:
+            gi, oi, g = raster
+            ea, eb = extents[gi], extents[oi]
+            mi, ni2 = min(gi, oi), max(gi, oi)
+            sn = strides[ni2]
+            self.emitter.raw("// raster decode (grouped CTA swizzle)")
+            rg = self.emitter.regs.new("r")
+            self.emitter.ins(f"mov.u32 {rg}, {g};")
+            rgeb = self.emitter.regs.new("r")
+            self.emitter.ins(f"mov.u32 {rgeb}, {g * eb};")
+            reaeb = self.emitter.regs.new("r")
+            self.emitter.ins(f"mov.u32 {reaeb}, {ea * eb};")
+            rea = self.emitter.regs.new("r")
+            self.emitter.ins(f"mov.u32 {rea}, {ea};")
+            sub = gid if sn == 1 else None
+            if sub is None:
+                sub = self.emitter.regs.new("r")
+                self.emitter.ins(f"div.u32 {sub}, {gid}, {sn};")
+            if mi != 0:
+                rsub = self.emitter.regs.new("r")
+                self.emitter.ins(f"rem.u32 {rsub}, {sub}, {reaeb};")
+                sub = rsub
+            if ea % g == 0:
+                t1 = self.emitter.regs.new("r")
+                t2 = self.emitter.regs.new("r")
+                self.emitter.ins(f"div.u32 {t1}, {sub}, {rgeb};")
+                self.emitter.ins(f"mad.lo.u32 {t1}, {t1}, {rg}, 0;")
+                self.emitter.ins(f"rem.u32 {t2}, {sub}, {rg};")
+                a_expr_reg = self.emitter.regs.new("r")
+                self.emitter.ins(f"add.u32 {a_expr_reg}, {t1}, {t2};")
+                b_expr_reg = self.emitter.regs.new("r")
+                self.emitter.ins(f"rem.u32 {b_expr_reg}, {sub}, {rgeb};")
+                self.emitter.ins(f"div.u32 {b_expr_reg}, {b_expr_reg}, {rg};")
+            else:
+                rgrp = self.emitter.regs.new("r")
+                self.emitter.ins(f"div.u32 {rgrp}, {sub}, {rgeb};")
+                rsz = self.emitter.regs.new("r")
+                self.emitter.ins(f"mad.lo.u32 {rsz}, {rgrp}, {rg}, 0;")
+                self.emitter.ins(f"sub.u32 {rsz}, {rea}, {rsz};")
+                self.emitter.ins(f"min.u32 {rsz}, {rsz}, {rg};")
+                tmp = self.emitter.regs.new("r")
+                self.emitter.ins(f"rem.u32 {tmp}, {sub}, {rgeb};")
+                tmp2 = self.emitter.regs.new("r")
+                self.emitter.ins(f"rem.u32 {tmp2}, {tmp}, {rsz};")
+                a_expr_reg = self.emitter.regs.new("r")
+                self.emitter.ins(f"mad.lo.u32 {a_expr_reg}, {rgrp}, {rg}, 0;")
+                self.emitter.ins(f"add.u32 {a_expr_reg}, {a_expr_reg}, {tmp2};")
+                b_expr_reg = self.emitter.regs.new("r")
+                self.emitter.ins(f"div.u32 {b_expr_reg}, {tmp}, {rsz};")
+
         for i, (axis, extent, stride) in enumerate(zip(s.axes, extents, strides)):
             if extent == 1:
                 reg = self.int_reg(0)
+            elif raster is not None and i == gi:
+                reg = a_expr_reg if raster is not None else None
+            elif raster is not None and i == oi:
+                reg = b_expr_reg if raster is not None else None
             elif i == len(extents) - 1:
                 reg = self.emitter.regs.new("r")
                 self.emitter.ins(f"rem.s32 {reg}, {gid}, {extent};")
@@ -1095,7 +1162,40 @@ class Compiler:
         last_val, dt = self.expr(branches[-1].value)
         dtype = dtype_name(dt)
         self.values[s.name] = last_val
-        self.value_dtypes[s.name] = dtype
+        self.value_dtypes[s.name] = dt
+
+    def stmt_zero_prologue(self, s):
+        dst = s.dst
+        words = int(s.words)
+        if words <= 0:
+            return
+        cta = self.builtin(Builtin("blockIdx.x"))[0]
+        guard = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.ne.u32 {guard}, {cta}, 0;")
+        end = self.emitter.label("ZPRO_END")
+        self.emitter.ins(f"@{guard} bra {end};")
+        tid = self.special.get("threadIdx.x")
+        if tid is None:
+            tid = self.emitter.regs.new("r")
+            self.emitter.ins(f"mov.u32 {tid}, %tid.x;")
+            self.special["threadIdx.x"] = tcount = tid
+        ntid = self.emitter.regs.new("r")
+        self.emitter.ins(f"mov.u32 {ntid}, %ntid.x;")
+        base = self.global_addr(dst, (0,))[0]
+        wreg = self.emitter.regs.new("r")
+        self.emitter.ins(f"mov.u32 {wreg}, {tid};")
+        loop = self.emitter.label("ZPRO_LOOP")
+        done = self.emitter.label("ZPRO_DONE")
+        p2 = self.emitter.regs.new("p")
+        self.emitter.raw(loop + ":")
+        self.emitter.ins(f"setp.ge.u32 {p2}, {wreg}, {words};")
+        self.emitter.ins(f"@{p2} bra {done};")
+        addr = self.emitter.regs.new("r")
+        self.emitter.ins(f"mad.lo.u32 {addr}, {wreg}, 4;")
+        self.emitter.ins(f"st.global.u32 [{base} + {addr}], 0;")
+        self.emitter.ins(f"add.u32 {wreg}, {wreg}, {ntid};")
+        self.emitter.ins(f"bra {loop};")
+        self.emitter.raw(end + ":")
         for branch in reversed(branches[:-1]):
             p = self.to_pred(branch.select)
             v, vdt = self.expr(branch.value)
