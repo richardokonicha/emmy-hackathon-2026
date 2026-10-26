@@ -1,0 +1,63 @@
+{
+ "id": "x04_sigmoid_exp",
+ "code": "x = torch.randn(513); y = torch.randn(513); torch.sigmoid(x) * torch.exp(y)",
+ "rtol": 1e-05,
+ "atol": 1e-05,
+ "graph_inputs": [
+  "x",
+  "y"
+ ],
+ "graph_outputs": [
+  "mul"
+ ],
+ "kernels": [
+  {
+   "node": "mul",
+   "entry": "k_mul_pointwise",
+   "arg_order": [
+    "y",
+    "x",
+    "mul"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "y",
+     "dtype": "f32",
+     "shape": [
+      513
+     ],
+     "seed": 1
+    },
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      513
+     ],
+     "seed": 0
+    },
+    {
+     "name": "mul",
+     "dtype": "f32",
+     "shape": [
+      513
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

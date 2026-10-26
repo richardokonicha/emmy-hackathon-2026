@@ -413,6 +413,8 @@ class Compiler:
         return reg, "f32"
 
     def expr(self, e):
+        if isinstance(e, str):
+            e = Var(e)
         if isinstance(e, Literal):
             name = dtype_name(e.dtype)
             if name.startswith("s") or name.startswith("i") or name == "int" or isinstance(e.value, int):
@@ -438,6 +440,10 @@ class Compiler:
         raise SystemExit(f"unsupported expression {type(e).__name__}: {e!r}")
 
     def coerce(self, reg, dt, target):
+        if dtype_name(dt) == "pred":
+            t = self.emitter.regs.new("r")
+            self.emitter.ins(f"selp.b32 {t}, 1, 0, {reg};")
+            reg, dt = t, "s32"
         if dtype_name(dt) == dtype_name(target):
             return reg
         if is_float(target) and not is_float(dt):
@@ -566,17 +572,65 @@ class Compiler:
     # ------------------------------------------------------------------
     # elementwise ops
     # ------------------------------------------------------------------
-    def op_on_regs(self, op, args, dtype="f32", dest=None):
+    def op_on_regs(self, op, args, dtype="f32", dest=None, arg_dtypes=None):
         name = getattr(op, "name", str(op))
         dt = dtype_name(dtype)
+        adts = list(arg_dtypes or [])
+
+        if name in ("greater", "greater_equal", "less", "less_equal", "equal", "not_equal"):
+            a, b = args
+            adt = adts[0] if adts else ("f32" if a.startswith("%f") else "s32")
+            kind = "f32" if is_float(adt) else "s32"
+            cmp = {
+                "greater": "gt",
+                "greater_equal": "ge",
+                "less": "lt",
+                "less_equal": "le",
+                "equal": "eq",
+                "not_equal": "ne",
+            }[name]
+            out = self.emitter.regs.new("p")
+            self.emitter.ins(f"setp.{cmp}.{kind} {out}, {a}, {b};")
+            return out, "pred"
+
         if name == "where":
             cond, a, b = args
-            p = self.emitter.regs.new("p")
-            self.emitter.ins(f"setp.ne.s32 {p}, {cond}, 0;")
+            cdt = adts[0] if adts else None
+            if cdt != "pred":
+                p = self.emitter.regs.new("p")
+                kind = "f32" if cdt is not None and is_float(cdt) else "s32"
+                self.emitter.ins(f"setp.ne.{kind} {p}, {cond}, 0;")
+                cond = p
             out = self.emitter.regs.new("f" if is_float(dt) else "r")
-            self.emitter.ins(f"selp.{ptx_type(dt)} {out}, {a}, {b}, {p};")
+            self.emitter.ins(f"selp.{ptx_type(dt)} {out}, {a}, {b}, {cond};")
             return out, dt
 
+        if name in ("negative", "neg"):
+            a = args[0]
+            adt = adts[0] if adts else ("f32" if a.startswith("%f") else "s32")
+            out = self.emitter.regs.new("f" if is_float(adt) else "r")
+            self.emitter.ins(f"neg.{ptx_type(adt)} {out}, {a};")
+            return out, adt
+
+        if name in ("logical_and", "logical_or", "logical_not"):
+            if name == "logical_not":
+                a = args[0]
+                adt = adts[0] if adts else "s32"
+                out = self.emitter.regs.new("p")
+                if adt == "pred":
+                    self.emitter.ins(f"not.pred {out}, {a};")
+                else:
+                    self.emitter.ins(f"setp.eq.{ptx_type(adt)} {out}, {a}, 0;")
+                return out, "pred"
+            a, b = args
+            if adts[0] == "pred" and adts[1] == "pred":
+                out = self.emitter.regs.new("p")
+                self.emitter.ins(f"{name.split('_')[1]}.pred {out}, {a}, {b};")
+                return out, "pred"
+            out = self.emitter.regs.new("r")
+            opc = name.split("_")[1]
+            self.emitter.ins(f"{opc}.b32 {out}, {a}, {b};")
+            return out, "s32"
         if name in ("exp", "exp_fast"):
             x = args[0]
             t = self.emitter.regs.new("f")
@@ -881,11 +935,13 @@ class Compiler:
     def stmt_assign(self, s):
         dtype = dtype_name(s.dtype) if s.dtype is not None else self.value_dtypes[s.args[0]]
         regs = []
+        arg_dts = []
         for name in s.args:
             if name not in self.values:
                 raise SystemExit(f"Assign {s.name}: unknown value {name!r}")
             regs.append(self.values[name])
-        reg, dt = self.op_on_regs(s.op, regs, dtype)
+            arg_dts.append(self.value_dtypes[name])
+        reg, dt = self.op_on_regs(s.op, regs, dtype, arg_dtypes=arg_dts)
         self.values[s.name] = reg
         self.value_dtypes[s.name] = dt
 
@@ -1161,8 +1217,15 @@ class Compiler:
             raise SystemExit(f"Select {s.name} has no branches")
         last_val, dt = self.expr(branches[-1].value)
         dtype = dtype_name(dt)
-        self.values[s.name] = last_val
-        self.value_dtypes[s.name] = dt
+        out = self.emitter.regs.new("f" if is_float(dtype) else "r")
+        self.emitter.ins(f"mov.{ptx_type(dtype)} {out}, {last_val};")
+        self.values[s.name] = out
+        self.value_dtypes[s.name] = dtype
+        for branch in reversed(branches[:-1]):
+            p = self.to_pred(branch.select)
+            v, vdt = self.expr(branch.value)
+            v = self.coerce(v, vdt, dtype)
+            self.emitter.ins(f"@{p} mov.{ptx_type(dtype)} {out}, {v};")
 
     def stmt_zero_prologue(self, s):
         dst = s.dst
@@ -1178,7 +1241,7 @@ class Compiler:
         if tid is None:
             tid = self.emitter.regs.new("r")
             self.emitter.ins(f"mov.u32 {tid}, %tid.x;")
-            self.special["threadIdx.x"] = tcount = tid
+            self.special["threadIdx.x"] = tid
         ntid = self.emitter.regs.new("r")
         self.emitter.ins(f"mov.u32 {ntid}, %ntid.x;")
         base = self.global_addr(dst, (0,))[0]
@@ -1196,11 +1259,6 @@ class Compiler:
         self.emitter.ins(f"add.u32 {wreg}, {wreg}, {ntid};")
         self.emitter.ins(f"bra {loop};")
         self.emitter.raw(end + ":")
-        for branch in reversed(branches[:-1]):
-            p = self.to_pred(branch.select)
-            v, vdt = self.expr(branch.value)
-            v = self.coerce(v, vdt, dtype)
-            self.emitter.ins(f"@{p} mov.{ptx_type(dtype)} {self.values[s.name]}, {v};")
 
     # ------------------------------------------------------------------
     # module

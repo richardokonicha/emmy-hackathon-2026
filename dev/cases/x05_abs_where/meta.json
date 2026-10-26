@@ -1,0 +1,64 @@
+{
+ "id": "x05_abs_where",
+ "code": "x = torch.randn(300); torch.where(x > 0, x, -x)",
+ "rtol": 0,
+ "atol": 0,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "where"
+ ],
+ "kernels": [
+  {
+   "node": "where",
+   "entry": "k_where_pointwise",
+   "arg_order": [
+    "gt_c1",
+    "x",
+    "where"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "gt_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      0.0
+     ]
+    },
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      300
+     ],
+     "seed": 0
+    },
+    {
+     "name": "where",
+     "dtype": "f32",
+     "shape": [
+      300
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

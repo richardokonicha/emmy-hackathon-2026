@@ -1,0 +1,75 @@
+{
+ "id": "x02_scale_shift_1000",
+ "code": "torch.randn(1000) * 2.5 - 3.0",
+ "rtol": 1e-06,
+ "atol": 1e-06,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "sub"
+ ],
+ "kernels": [
+  {
+   "node": "sub",
+   "entry": "k_sub_pointwise",
+   "arg_order": [
+    "sub_c1",
+    "mul_c1",
+    "x",
+    "sub"
+   ],
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "sub_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      3.0
+     ]
+    },
+    {
+     "name": "mul_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      2.5
+     ]
+    },
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      1000
+     ],
+     "seed": 0
+    },
+    {
+     "name": "sub",
+     "dtype": "f32",
+     "shape": [
+      1000
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

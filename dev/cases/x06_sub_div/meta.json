@@ -1,0 +1,84 @@
+{
+ "id": "x06_sub_div",
+ "code": "x = torch.randn(1023); y = torch.randn(1023); z = torch.randn(1023); (x - y) / (z + 1.0)",
+ "rtol": 1e-05,
+ "atol": 1e-05,
+ "graph_inputs": [
+  "x",
+  "y",
+  "z"
+ ],
+ "graph_outputs": [
+  "div"
+ ],
+ "kernels": [
+  {
+   "node": "div",
+   "entry": "k_div_pointwise",
+   "arg_order": [
+    "add_c1",
+    "y",
+    "x",
+    "z",
+    "div"
+   ],
+   "grid": [
+    2,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "add_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      1.0
+     ]
+    },
+    {
+     "name": "y",
+     "dtype": "f32",
+     "shape": [
+      1023
+     ],
+     "seed": 1
+    },
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      1023
+     ],
+     "seed": 0
+    },
+    {
+     "name": "z",
+     "dtype": "f32",
+     "shape": [
+      1023
+     ],
+     "seed": 2
+    },
+    {
+     "name": "div",
+     "dtype": "f32",
+     "shape": [
+      1023
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

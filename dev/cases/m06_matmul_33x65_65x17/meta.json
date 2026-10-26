@@ -1,0 +1,66 @@
+{
+ "id": "m06_matmul_33x65_65x17",
+ "code": "torch.randn(33, 65) @ torch.randn(65, 17)",
+ "rtol": 0.001,
+ "atol": 0.001,
+ "graph_inputs": [
+  "x0",
+  "x1"
+ ],
+ "graph_outputs": [
+  "matmul"
+ ],
+ "kernels": [
+  {
+   "node": "matmul",
+   "entry": "k_matmul_da0634",
+   "arg_order": [
+    "x1",
+    "x0",
+    "matmul"
+   ],
+   "grid": [
+    561,
+    1,
+    1
+   ],
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x1",
+     "dtype": "f32",
+     "shape": [
+      65,
+      17
+     ],
+     "seed": 1
+    },
+    {
+     "name": "x0",
+     "dtype": "f32",
+     "shape": [
+      33,
+      65
+     ],
+     "seed": 0
+    },
+    {
+     "name": "matmul",
+     "dtype": "f32",
+     "shape": [
+      33,
+      17
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

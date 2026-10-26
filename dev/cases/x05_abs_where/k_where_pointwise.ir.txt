@@ -1,0 +1,12 @@
+    Tile[a0] (N=150)
+        in0__u0 = load gt_c1[0]
+        in1__u0 = load x[((a0 * 2) + 0)]
+        bool v0__u0 = greater(in1__u0, in0__u0)
+        f32 v1__u0 = negative(in1__u0)
+        f32 v2__u0 = where(v0__u0, in1__u0, v1__u0)
+        in0__u1 = load gt_c1[0]
+        in1__u1 = load x[((a0 * 2) + 1)]
+        bool v0__u1 = greater(in1__u1, in0__u1)
+        f32 v1__u1 = negative(in1__u1)
+        f32 v2__u1 = where(v0__u1, in1__u1, v1__u1)
+        where[((a0 * 2) + 0)] = (v2__u0, v2__u1)
