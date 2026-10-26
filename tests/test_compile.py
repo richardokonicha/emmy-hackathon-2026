@@ -166,6 +166,41 @@ class VectorMemoryTests(unittest.TestCase):
         self.assertNotIn("st.global.v2.f32", ptx)
 
 
+class WideVectorTests(unittest.TestCase):
+    """TASK.md: a grouped write of 4 values is a v4 vector store."""
+
+    ALIGNED4 = "BinaryExpr(op='*', left=Var(name='a0'), right=Literal(value=4, dtype='int'))"
+    UNALIGNED4 = (
+        "BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='a0'), "
+        "right=Literal(value=4, dtype='int')), right=Literal(value=1, dtype='int'))"
+    )
+
+    def test_four_wide_group_is_one_v4_store(self):
+        mod = load_compiler()
+        ptx = mod.compile_file(_wide_ir(4, self.ALIGNED4, 256))
+        self.assertIn("st.global.v4.f32", ptx)
+        self.assertEqual(ptx.count("st.global"), 1)
+        self.assertNotIn("st.global.f32", ptx)
+
+    def test_four_wide_group_is_one_v4_load(self):
+        mod = load_compiler()
+        ptx = mod.compile_file(_wide_ir(4, self.ALIGNED4, 256))
+        self.assertIn("ld.global.v4.f32", ptx)
+        self.assertEqual(ptx.count("ld.global"), 2)
+
+    def test_unaligned_four_wide_group_stays_scalar(self):
+        mod = load_compiler()
+        ptx = mod.compile_file(_wide_ir(4, self.UNALIGNED4, 256))
+        self.assertNotIn("st.global.v4.f32", ptx)
+        self.assertIn("st.global.f32", ptx)
+
+    def test_size_not_divisible_by_width_stays_scalar(self):
+        mod = load_compiler()
+        ptx = mod.compile_file(_wide_ir(4, self.ALIGNED4, 254))
+        self.assertNotIn("st.global.v4.f32", ptx)
+        self.assertIn("st.global.f32", ptx)
+
+
 class ContractTests(unittest.TestCase):
     def test_entry_name_comes_from_the_ir(self):
         mod = load_compiler()
@@ -224,6 +259,53 @@ def _tile(inner, axis_extent=4):
         "Tile(axes=(Axis(name='a0', extent=Dim(%d), window=None),), body=(%s,))"
         % (axis_extent, inner)
     )
+
+
+def _wide_body(width, idx, out_len=256):
+    """A width-N grouped load/add/write over one buffer."""
+    parts = []
+    for buf in ("x0", "x1"):
+        names = ", ".join("'in%s__u%d'" % (buf, k) for k in range(width)) + ","
+        parts.append(
+            "Load(names=(%s), input='%s', index=(%s,), dtype=%s)"
+            % (names, buf, idx, F32_DTYPE)
+        )
+    for k in range(width):
+        parts.append(
+            "Assign(name='v0__u%d', op=ElementwiseImpl('add'), "
+            "args=('inx0__u%d', 'inx1__u%d'), dtype=%s)" % (k, k, k, F32_DTYPE)
+        )
+    values = ", ".join("'v0__u%d'" % k for k in range(width)) + ","
+    parts.append(
+        "Write(output='add', index=(%s,), values=(%s), value_dtype=%s, atomic=False, swizzle='NONE')"
+        % (idx, values, F32_DTYPE)
+    )
+    return ", ".join(parts)
+
+
+def _wide_ir(width, index_expr, out_len=256):
+    """Build a synthetic package whose 'add' output has `out_len` elements."""
+    td = Path(tempfile.mkdtemp())
+    dst = td / "case"
+    shutil.copytree(ROOT / "problems" / "p01_vector_add", dst, dirs_exist_ok=True)
+    ir = next(dst.glob("*.ir.json"))
+    doc = json.loads(ir.read_text())
+    for node in doc["nodes"].values():
+        if node["op"] == "KernelOp":
+            node["op_fields"]["body"] = [
+                _tile(_wide_body(width, index_expr, out_len), axis_extent=out_len // width)
+            ]
+        for o in node.get("outputs", []):
+            if o["name"] == "add":
+                o["shape"] = [out_len]
+    ir.write_text(json.dumps(doc, indent=1))
+    meta_path = dst / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    for kern in meta["kernels"]:
+        for arg in kern["args"]:
+            arg["shape"] = [out_len]
+    meta_path.write_text(json.dumps(meta, indent=1))
+    return ir
 
 
 def synthetic_ir(body_str: str) -> Path:
