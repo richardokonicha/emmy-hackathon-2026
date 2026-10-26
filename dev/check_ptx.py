@@ -29,7 +29,7 @@ def main() -> int:
             print(proc.stderr[-800:])
             failed.append(problem.name)
             continue
-        resp = requests.post(URL, data=proc.stdout, timeout=60)
+        resp = requests.post(URL, json={"ptx": proc.stdout}, timeout=60)
         text = resp.text.strip()
         ok = resp.status_code == 200 and "error" not in text.lower()
         print(f"{problem.name:<24} {'PTXAS-OK' if ok else 'PTXAS-FAIL'}")
