@@ -200,5 +200,117 @@ class ContractTests(unittest.TestCase):
             comp.stmt(_CarryStatement())
 
 
+F32_DTYPE = "DataType(name='f32', np=dtype('float32'), nbytes=4)"
+
+BODY_TMPL = (
+    "Load(names=('in0__u0',), input='x0', index=({idx},), dtype=" + F32_DTYPE + "), "
+    "Assign(name='v0__u0', op=ElementwiseImpl('add'), args=('in0__u0', 'in0__u0'), "
+    "dtype=" + F32_DTYPE + "), "
+    "Write(output='add', index=({idx},), values=('v0__u0',), value_dtype=" + F32_DTYPE
+    + ", atomic=False, swizzle='NONE')"
+)
+
+
+def _body(idx):
+    return ", ".join(
+        [
+            BODY_TMPL.format(idx=idx),
+        ]
+    )
+
+
+def _tile(inner, axis_extent=4):
+    return (
+        "Tile(axes=(Axis(name='a0', extent=Dim(%d), window=None),), body=(%s,))"
+        % (axis_extent, inner)
+    )
+
+
+def synthetic_ir(body_str: str) -> Path:
+    """Copy p01 into a temp dir with the KernelOp body replaced."""
+    td = Path(tempfile.mkdtemp())
+    dst = td / "case"
+    shutil.copytree(ROOT / "problems" / "p01_vector_add", dst, dirs_exist_ok=True)
+    ir = next(dst.glob("*.ir.json"))
+    doc = json.loads(ir.read_text())
+    for node in doc["nodes"].values():
+        if node["op"] == "KernelOp":
+            node["op_fields"]["body"] = [body_str]
+    ir.write_text(json.dumps(doc, indent=1))
+    return ir
+
+
+class UnrollTests(unittest.TestCase):
+    """Unrolling must be honoured AND bounded (a wide loop must stay rolled)."""
+
+    def _loop_body(self, extent):
+        inner = (
+            "Loop(axis=Axis(name='i', extent=Dim(%d), window=None), body=(%s,), "
+            "unroll=True, seed=False)" % (extent, _body("Var(name='i')"))
+        )
+        return _tile(inner)
+
+    def test_small_loop_is_unrolled(self):
+        mod = load_compiler()
+        ptx = mod.compile_file(synthetic_ir(self._loop_body(8)))
+        self.assertEqual(ptx.count("ld.global"), 8)
+        self.assertNotIn("LOOP_", ptx)
+
+    def test_wide_loop_stays_rolled(self):
+        mod = load_compiler()
+        ptx = mod.compile_file(synthetic_ir(self._loop_body(4096)))
+        self.assertEqual(ptx.count("ld.global"), 1)
+        self.assertIn("LOOP_", ptx)
+
+    def test_strided_loop_honours_unroll(self):
+        mod = load_compiler()
+        inner = (
+            "StridedLoop(axis=Axis(name='i', extent=Dim(8), window=None), "
+            "start=Literal(value=0, dtype='int'), step=Literal(value=1, dtype='int'), "
+            "body=(%s,), unroll=True, end=None, seed=False)" % _body("Var(name='i')")
+        )
+        ptx = mod.compile_file(synthetic_ir(_tile(inner)))
+        self.assertEqual(ptx.count("ld.global"), 8)
+        self.assertNotIn("SL_", ptx)
+
+
+class DtypeTests(unittest.TestCase):
+    def test_float16_bits_are_half_precision(self):
+        mod = load_compiler()
+        self.assertEqual(mod.float16_bits(1.0), 0x3C00)
+        self.assertEqual(mod.float16_bits(0.5), 0x3800)
+        self.assertEqual(mod.float16_bits(-2.0), 0xC000)
+
+    def test_float64_bits(self):
+        mod = load_compiler()
+        self.assertEqual(mod.float64_bits(1.0), 0x3FF0000000000000)
+
+    def test_f64_setp_uses_a_register_immediate(self):
+        """ptxas rejects a 64-bit immediate in setp.ne.f64."""
+        mod = load_compiler()
+        comp = mod.Compiler(ir_path("p01_vector_add"))
+        comp.values["probe"] = comp.emitter.regs.new("d")
+        comp.value_dtypes["probe"] = "f64"
+        comp.to_pred(mod.Var("probe"))
+        emitted = [l.strip() for l in comp.emitter.lines if "setp" in l]
+        self.assertEqual(len(emitted), 1, emitted)
+        self.assertIn("setp.ne.f64", emitted[0])
+        self.assertNotIn("0x0000000000000000", emitted[0])
+        self.assertTrue(any("mov.f64" in l for l in comp.emitter.lines), comp.emitter.lines)
+
+    def test_zero_prologue_uses_full_address_register(self):
+        """global_addr returns a register name, not a sequence: [0] took one char."""
+        from emmy.compiler.ir.stmt.leaves import ZeroPrologue
+
+        mod = load_compiler()
+        comp = mod.Compiler(ir_path("p01_vector_add"))
+        comp.emit_prologue()
+        comp.stmt_zero_prologue(ZeroPrologue(dst="add", words=16))
+        stores = [l.strip() for l in comp.emitter.lines if "st.global.u32" in l]
+        self.assertTrue(stores, comp.emitter.lines)
+        # the address operand must be a whole register, e.g. "[%rd9 + %r3]"
+        self.assertRegex(stores[0], r"st\.global\.u32 \[%rd\d+( \+ %r\d+)?\], 0;")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,10 @@ from emmy.compiler.ir.stmt import (
 
 PTX_HEADER = ".version 8.0\n.target sm_89\n.address_size 64\n"
 SMEM_STATIC_LIMIT = 48 * 1024
+# Upper bound on fully-unrolled trip count.  Unrolling a large loop would
+# explode the PTX (extent 100k -> 30+ MB) and stall ptxas, so wide loops
+# stay rolled.
+MAX_UNROLL = 64
 
 _DTYPE_ALIASES = {
     "float": "f32",
@@ -488,7 +492,9 @@ class Compiler:
             return reg
         p = self.emitter.regs.new("p")
         if dt == "f64":
-            self.emitter.ins(f"setp.ne.f64 {p}, {reg}, 0x0000000000000000;")
+            zero = self.emitter.regs.new("d")
+            self.emitter.ins(f"mov.f64 {zero}, 0d0000000000000000;")
+            self.emitter.ins(f"setp.ne.f64 {p}, {reg}, {zero};")
         elif dt == "f32":
             self.emitter.ins(f"setp.ne.f32 {p}, {reg}, 0f00000000;")
         elif dt == "f16":
@@ -1424,10 +1430,10 @@ class Compiler:
             self.seed_accums(s.body, loop_axis=s.axis.name)
         old = self.values.get(s.axis.name)
         self.value_dtypes[s.axis.name] = "s32"
-        if s.unroll:
+        if s.unroll and extent <= MAX_UNROLL:
             # Fully unroll a static trip-count loop: emit the body once per
             # iteration with the axis bound to a constant, removing branch
-            # and counter overhead.
+            # and counter overhead.  Wide loops stay rolled (see MAX_UNROLL).
             for i in range(extent):
                 self.values[s.axis.name] = self.int_reg(i)
                 self.stmt(s.body)
@@ -1450,11 +1456,51 @@ class Compiler:
             self.values.pop(s.axis.name, None)
             self.value_dtypes.pop(s.axis.name, None)
 
+    def _strided_trip_count(self, s):
+        """Static trip count of a StridedLoop, or None when it is not known."""
+        start = self.const_int(s.start)
+        step = self.const_int(s.step)
+        if start is None or step is None or step == 0:
+            return None
+        if s.end is None:
+            if not s.axis.extent.is_static:
+                return None
+            end = int(s.axis.extent.as_static())
+        else:
+            end = self.const_int(s.end)
+            if end is None:
+                return None
+        if step > 0:
+            return max(0, -(-(end - start) // step))
+        if step < 0:
+            return max(0, -(-(start - end) // (-step)))
+        return None
+
+    def _unroll_strided(self, s, trip):
+        """Emit a StridedLoop body once per statically-known iteration."""
+        start = self.const_int(s.start)
+        step = self.const_int(s.step)
+        axis = s.axis.name
+        old = self.values.get(axis)
+        self.value_dtypes[axis] = "s32"
+        for i in range(trip):
+            self.values[axis] = self.int_reg(start + i * step)
+            self.stmt(s.body)
+        if old is not None:
+            self.values[axis] = old
+        else:
+            self.values.pop(axis, None)
+            self.value_dtypes.pop(axis, None)
+
     def stmt_strided_loop(self, s):
         loop_axis = getattr(s, "axis", None)
         loop_axis = loop_axis.name if loop_axis is not None else None
         if s.seed:
             self.seed_accums(s.body, loop_axis=loop_axis)
+        trip = self._strided_trip_count(s)
+        if getattr(s, "unroll", False) and trip is not None and 0 < trip <= MAX_UNROLL:
+            self._unroll_strided(s, trip)
+            return
         start, _ = self.expr(s.start)
         counter = self.emitter.regs.new("r")
         self.emitter.ins(f"mov.s32 {counter}, {start};")
