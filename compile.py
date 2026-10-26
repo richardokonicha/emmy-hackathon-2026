@@ -86,8 +86,14 @@ def is_float(dt) -> bool:
 
 def ptx_type(dt) -> str:
     name = dtype_name(dt)
-    if name in ("f32", "f16", "f64"):
-        return name
+    if name == "f32":
+        return "f32"
+    if name == "f16":
+        # ptxas rejects ld/global.f16; f16 values live in .b16 registers and
+        # are loaded/stored as 16-bit quantities.
+        return "b16"
+    if name == "f64":
+        return "f64"
     if name in ("s32", "i32", "int"):
         return "s32"
     if name in ("s64", "i64"):
@@ -97,8 +103,31 @@ def ptx_type(dt) -> str:
     raise SystemExit(f"unsupported PTX type: {name}")
 
 
+def reg_kind(dt) -> str:
+    """Register-kind letter for a dtype (used by Regs.new/declarations)."""
+    name = dtype_name(dt)
+    if name == "f32":
+        return "f"
+    if name == "f16":
+        return "h"
+    if name == "f64":
+        return "d"
+    if name in ("s32", "i32", "int", "s64", "i64", "b32", "u32"):
+        return "r"
+    raise SystemExit(f"unsupported register kind: {name}")
+
+
+def ldst_type(dt) -> str:
+    """PTX load/store type for a dtype (f16 uses b16; f64 uses f64)."""
+    return ptx_type(dt)
+
+
 def float_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+
+def float64_bits(value: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", float(value)))[0]
 
 
 def sanitize(name: str) -> str:
@@ -106,10 +135,14 @@ def sanitize(name: str) -> str:
 
 
 class Regs:
-    """Virtual register pool.  ptxas does the physical allocation."""
+    """Virtual register pool.  ptxas does the physical allocation.
+
+    Kind letters map to PTX register types: ``f`` f32, ``r`` b32/s32,
+    ``rd`` b64/u64, ``h`` b16 (f16 storage), ``d`` f64, ``p`` pred.
+    """
 
     def __init__(self):
-        self.n = {"f": 0, "r": 0, "rd": 0, "p": 0}
+        self.n = {"f": 0, "r": 0, "rd": 0, "h": 0, "d": 0, "p": 0}
 
     def new(self, kind: str) -> str:
         self.n[kind] += 1
@@ -119,6 +152,8 @@ class Regs:
         return [
             f"        .reg .pred %p<{self.n['p'] + 1}>;",
             f"        .reg .f32  %f<{self.n['f'] + 1}>;",
+            f"        .reg .b16  %h<{self.n['h'] + 1}>;",
+            f"        .reg .f64  %d<{self.n['d'] + 1}>;",
             f"        .reg .b32  %r<{self.n['r'] + 1}>;",
             f"        .reg .b64  %rd<{self.n['rd'] + 1}>;",
         ]
@@ -314,9 +349,18 @@ class Compiler:
         self.emitter.ins(f"mov.s32 {reg}, {int(value)};")
         return reg
 
-    def fconst(self, value: float) -> str:
-        reg = self.emitter.regs.new("f")
-        self.emitter.ins(f"mov.f32 {reg}, 0f{float_bits(value):08X};")
+    def fconst(self, value: float, dtype="f32") -> str:
+        name = dtype_name(dtype)
+        reg = self.emitter.regs.new(reg_kind(dtype))
+        if name == "f32":
+            self.emitter.ins(f"mov.f32 {reg}, 0f{float_bits(value):08X};")
+        elif name == "f64":
+            self.emitter.ins(f"mov.f64 {reg}, 0x{float64_bits(value):016X};")
+        elif name == "f16":
+            self.emitter.ins(f"mov.b16 {reg}, 0x{float_bits(value):04X};")
+        else:
+            reg = self.int_reg(int(value))
+            return reg
         return reg
 
     def mul_int(self, a: str, b) -> str:
@@ -436,8 +480,12 @@ class Compiler:
         if dt == "pred":
             return reg
         p = self.emitter.regs.new("p")
-        if is_float(dt):
+        if dt == "f64":
+            self.emitter.ins(f"setp.ne.f64 {p}, {reg}, 0x0000000000000000;")
+        elif dt == "f32":
             self.emitter.ins(f"setp.ne.f32 {p}, {reg}, 0f00000000;")
+        elif dt == "f16":
+            self.emitter.ins(f"setp.ne.b16 {p}, {reg}, 0;")
         else:
             self.emitter.ins(f"setp.ne.s32 {p}, {reg}, 0;")
         return p
@@ -451,6 +499,14 @@ class Compiler:
             reg = self.emitter.regs.new("r")
             self.emitter.ins(f"mov.s32 {reg}, {int(value)};")
             return reg, "s32"
+        if name == "f64":
+            reg = self.emitter.regs.new("d")
+            self.emitter.ins(f"mov.f64 {reg}, 0x{float64_bits(float(value)):016X};")
+            return reg, "f64"
+        if name == "f16":
+            reg = self.emitter.regs.new("h")
+            self.emitter.ins(f"mov.b16 {reg}, 0x{float_bits(float(value)):04X};")
+            return reg, "f16"
         reg = self.emitter.regs.new("f")
         self.emitter.ins(f"mov.f32 {reg}, 0f{float_bits(value):08X};")
         return reg, "f32"
@@ -462,7 +518,7 @@ class Compiler:
             name = dtype_name(e.dtype)
             if name.startswith("s") or name.startswith("i") or name == "int" or isinstance(e.value, int):
                 return self.lit(e.value, "s32")
-            return self.lit(e.value, "f32")
+            return self.lit(e.value, name)
         if isinstance(e, Var):
             if e.name not in self.values:
                 raise SystemExit(f"unknown variable {e.name!r}")
@@ -483,19 +539,33 @@ class Compiler:
         raise SystemExit(f"unsupported expression {type(e).__name__}: {e!r}")
 
     def coerce(self, reg, dt, target):
-        if dtype_name(dt) == "pred":
+        dt = dtype_name(dt)
+        target = dtype_name(target)
+        if dt == "pred":
             t = self.emitter.regs.new("r")
             self.emitter.ins(f"selp.b32 {t}, 1, 0, {reg};")
             reg, dt = t, "s32"
-        if dtype_name(dt) == dtype_name(target):
+        if dt == target:
             return reg
+        if dt == "f16" or target == "f16":
+            # This ptxas rejects ld/global.f16 and has no .b16<->.f32/.f64
+            # conversion, so f16 cannot participate in arithmetic coercion.
+            raise SystemExit(f"f16 coercion {dt} -> {target} is unsupported")
         if is_float(target) and not is_float(dt):
-            out = self.emitter.regs.new("f")
-            self.emitter.ins(f"cvt.rn.f32.s32 {out}, {reg};")
+            out = self.emitter.regs.new(reg_kind(target))
+            op = {"f32": "cvt.rn.f32.s32", "f64": "cvt.rn.f64.s32"}[target]
+            self.emitter.ins(f"{op} {out}, {reg};")
             return out
         if not is_float(target) and is_float(dt):
-            out = self.emitter.regs.new("r")
-            self.emitter.ins(f"cvt.rzi.s32.f32 {out}, {reg};")
+            out = self.emitter.regs.new(reg_kind(target))
+            op = {"f32": "cvt.rzi.s32.f32", "f64": "cvt.rzi.s32.f64"}[dt]
+            self.emitter.ins(f"{op} {out}, {reg};")
+            return out
+        # float <-> float (f32 <-> f64)
+        if is_float(dt) and is_float(target):
+            out = self.emitter.regs.new(reg_kind(target))
+            op = {"f32": "cvt.rn.f32.f64", "f64": "cvt.rn.f64.f32"}[dt]
+            self.emitter.ins(f"{op} {out}, {reg};")
             return out
         return reg
 
@@ -505,11 +575,11 @@ class Compiler:
         op = e.op
 
         if op in ("==", "!=", "<", "<=", ">", ">="):
-            target = "f32" if (is_float(adt) or is_float(bdt)) else "s32"
+            target = "f64" if (adt == "f64" or bdt == "f64") else ("f32" if (is_float(adt) or is_float(bdt)) else "s32")
             a = self.coerce(a, adt, target)
             b = self.coerce(b, bdt, target)
             p = self.emitter.regs.new("p")
-            kind = "f32" if target == "f32" else "s32"
+            kind = {"f32": "f32", "f64": "f64"}.get(target, "s32")
             cmp = {"==": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}[op]
             self.emitter.ins(f"setp.{cmp}.{kind} {p}, {a}, {b};")
             return p, "pred"
@@ -523,7 +593,7 @@ class Compiler:
             self.emitter.ins(f"{op}.b32 {out}, {a}, {b};")
             return out, "s32"
 
-        target = "f32" if (is_float(adt) or is_float(bdt)) else "s32"
+        target = "f64" if (adt == "f64" or bdt == "f64") else ("f32" if (is_float(adt) or is_float(bdt)) else "s32")
         a = self.coerce(a, adt, target)
         b = self.coerce(b, bdt, target)
 
@@ -543,6 +613,23 @@ class Compiler:
             out = self.emitter.regs.new("f")
             self.emitter.ins(f"{ptxop} {out}, {a}, {b};")
             return out, "f32"
+
+        if target == "f64":
+            ptxop = {
+                "+": "add.f64",
+                "-": "sub.f64",
+                "*": "mul.f64",
+                "/": "div.rn.f64",
+                "maximum": "max.f64",
+                "minimum": "min.f64",
+                "max": "max.f64",
+                "min": "min.f64",
+            }.get(op)
+            if ptxop is None:
+                raise SystemExit(f"unsupported float binary op {op!r}")
+            out = self.emitter.regs.new("d")
+            self.emitter.ins(f"{ptxop} {out}, {a}, {b};")
+            return out, "f64"
 
         ptxop = {
             "+": "add.s32",
@@ -568,10 +655,10 @@ class Compiler:
         p = self.to_pred(e.cond)
         a, adt = self.expr(e.if_true)
         b, bdt = self.expr(e.if_false)
-        target = "f32" if (is_float(adt) or is_float(bdt)) else "s32"
+        target = "f64" if (adt == "f64" or bdt == "f64") else ("f32" if (is_float(adt) or is_float(bdt)) else "s32")
         a = self.coerce(a, adt, target)
         b = self.coerce(b, bdt, target)
-        out = self.emitter.regs.new("f" if target == "f32" else "r")
+        out = self.emitter.regs.new(reg_kind(target))
         self.emitter.ins(f"selp.{ptx_type(target)} {out}, {a}, {b}, {p};")
         return out, target
 
@@ -724,14 +811,14 @@ class Compiler:
                 kind = "f32" if cdt is not None and is_float(cdt) else "s32"
                 self.emitter.ins(f"setp.ne.{kind} {p}, {cond}, 0;")
                 cond = p
-            out = self.emitter.regs.new("f" if is_float(dt) else "r")
+            out = self.emitter.regs.new(reg_kind(dt))
             self.emitter.ins(f"selp.{ptx_type(dt)} {out}, {a}, {b}, {cond};")
             return out, dt
 
         if name in ("negative", "neg"):
             a = args[0]
             adt = adts[0] if adts else ("f32" if a.startswith("%f") else "s32")
-            out = self.emitter.regs.new("f" if is_float(adt) else "r")
+            out = self.emitter.regs.new(reg_kind(adt))
             self.emitter.ins(f"neg.{ptx_type(adt)} {out}, {a};")
             return out, adt
 
@@ -880,6 +967,12 @@ class Compiler:
             return out, "f32"
 
         if name in ("absolute", "abs"):
+            if dt == "f64":
+                out = self.emitter.regs.new("d")
+                self.emitter.ins(f"abs.f64 {out}, {args[0]};")
+                return out, "f64"
+            if dt == "f16":
+                raise SystemExit(f"unsupported float op abs for f16")
             if is_float(dt):
                 out = self.emitter.regs.new("f")
                 self.emitter.ins(f"abs.f32 {out}, {args[0]};")
@@ -889,6 +982,12 @@ class Compiler:
             return out, "s32"
 
         if name == "neg":
+            if dt == "f64":
+                out = self.emitter.regs.new("d")
+                self.emitter.ins(f"neg.f64 {out}, {args[0]};")
+                return out, "f64"
+            if dt == "f16":
+                raise SystemExit(f"unsupported float op neg for f16")
             if is_float(dt):
                 out = self.emitter.regs.new("f")
                 self.emitter.ins(f"neg.f32 {out}, {args[0]};")
@@ -898,7 +997,7 @@ class Compiler:
             return out, "s32"
 
         if name == "copy":
-            out = self.emitter.regs.new("f" if is_float(dt) else "r")
+            out = self.emitter.regs.new(reg_kind(dt))
             self.emitter.ins(f"mov.{ptx_type(dt)} {out}, {args[0]};")
             return out, dt
 
@@ -917,27 +1016,48 @@ class Compiler:
             raise SystemExit(f"unsupported fp8 decode op {name}")
 
         if is_float(dt):
+            if dt == "f16":
+                # This ptxas has no .b16 arithmetic or b16<->f32 conversion.
+                raise SystemExit(f"unsupported float op {name!r} for f16")
             ptxop = {
-                "add": "add.f32",
-                "sum": "add.f32",
-                "subtract": "sub.f32",
-                "sub": "sub.f32",
-                "multiply": "mul.f32",
-                "prod": "mul.f32",
-                "divide": "div.rn.f32",
-                "true_divide": "div.rn.f32",
-                "maximum": "max.f32",
-                "minimum": "min.f32",
-                "max": "max.f32",
-                "min": "min.f32",
-                "amax": "max.f32",
-                "amin": "min.f32",
-            }.get(name)
+                "f32": {
+                    "add": "add.f32",
+                    "sum": "add.f32",
+                    "subtract": "sub.f32",
+                    "sub": "sub.f32",
+                    "multiply": "mul.f32",
+                    "prod": "mul.f32",
+                    "divide": "div.rn.f32",
+                    "true_divide": "div.rn.f32",
+                    "maximum": "max.f32",
+                    "minimum": "min.f32",
+                    "max": "max.f32",
+                    "min": "min.f32",
+                    "amax": "max.f32",
+                    "amin": "min.f32",
+                },
+                "f64": {
+                    "add": "add.f64",
+                    "sum": "add.f64",
+                    "subtract": "sub.f64",
+                    "sub": "sub.f64",
+                    "multiply": "mul.f64",
+                    "prod": "mul.f64",
+                    "divide": "div.rn.f64",
+                    "true_divide": "div.rn.f64",
+                    "maximum": "max.f64",
+                    "minimum": "min.f64",
+                    "max": "max.f64",
+                    "min": "min.f64",
+                    "amax": "max.f64",
+                    "amin": "min.f64",
+                },
+            }[dt].get(name)
             if ptxop is None:
                 raise SystemExit(f"unsupported float op {name!r}")
-            out = dest or self.emitter.regs.new("f")
+            out = dest or self.emitter.regs.new(reg_kind(dt))
             self.emitter.ins(f"{ptxop} {out}, {args[0]}, {args[1]};")
-            return out, "f32"
+            return out, dt
 
         ptxop = {
             "add": "add.s32",
@@ -1162,11 +1282,11 @@ class Compiler:
             flat = self.flatten(input_name, idx)
             if input_name in self.smem:
                 addr = self.smem_elem_addr(input_name, flat)
-                reg = self.emitter.regs.new("f" if is_float(dtype) else "r")
+                reg = self.emitter.regs.new(reg_kind(dtype))
                 self.emitter.ins(f"ld.shared.{ptx_type(dtype)} {reg}, [{addr}];")
             else:
                 addr = self.global_addr(input_name, flat)
-                reg = self.emitter.regs.new("f" if is_float(dtype) else "r")
+                reg = self.emitter.regs.new(reg_kind(dtype))
                 self.emitter.ins(f"ld.global.{ptx_type(dtype)} {reg}, [{addr}];")
             self.values[name] = reg
             self.value_dtypes[name] = dtype
@@ -1246,7 +1366,7 @@ class Compiler:
     def stmt_init(self, s):
         dtype = dtype_name(s.dtype) if s.dtype is not None else "f32"
         if is_float(dtype):
-            reg = self.fconst(float(s.identity))
+            reg = self.fconst(float(s.identity), dtype)
         else:
             reg = self.int_reg(int(s.identity))
         self.values[s.name] = reg
@@ -1277,7 +1397,7 @@ class Compiler:
                 if identity is None:
                     raise SystemExit(f"no identity for accumulator op {st.op.name}")
                 if is_float(dtype):
-                    reg = self.fconst(float(identity))
+                    reg = self.fconst(float(identity), dtype)
                 else:
                     reg = self.int_reg(int(identity))
                 self.values[st.name] = reg
@@ -1373,7 +1493,10 @@ class Compiler:
                 self.emitter.ins(
                     f"shfl.sync.bfly.b32 {other}, {bits}, {step}, 0x1f, {mask};"
                 )
-                if is_float(dtype):
+                if dtype == "f64":
+                    reg = self.emitter.regs.new("d")
+                    self.emitter.ins(f"mov.b64 {reg}, {other};")
+                elif is_float(dtype):
                     reg = self.emitter.regs.new("f")
                     self.emitter.ins(f"mov.b32 {reg}, {other};")
                 else:
@@ -1418,8 +1541,8 @@ class Compiler:
                 b_idx = slot_expr(comp, step)
                 a_addr = self.smem_elem_addr(buf, a_idx)
                 b_addr = self.smem_elem_addr(buf, b_idx)
-                a = self.emitter.regs.new("f" if is_float(dtype) else "r")
-                b = self.emitter.regs.new("f" if is_float(dtype) else "r")
+                a = self.emitter.regs.new(reg_kind(dtype))
+                b = self.emitter.regs.new(reg_kind(dtype))
                 self.emitter.ins(f"ld.shared.{ptx_type(dtype)} {a}, [{a_addr}];")
                 self.emitter.ins(f"ld.shared.{ptx_type(dtype)} {b}, [{b_addr}];")
                 self.values[state] = a
@@ -1440,7 +1563,7 @@ class Compiler:
         for comp, (buf, state) in enumerate(zip(bufs, states)):
             root = self.int_reg(comp) if inner is not None else self.int_reg(0)
             addr = self.smem_elem_addr(buf, root)
-            reg = self.emitter.regs.new("f" if is_float(dtype) else "r")
+            reg = self.emitter.regs.new(reg_kind(dtype))
             self.emitter.ins(f"ld.shared.{ptx_type(dtype)} {reg}, [{addr}];")
             self.values[state] = reg
             self.value_dtypes[state] = dtype
@@ -1489,7 +1612,7 @@ class Compiler:
             raise SystemExit(f"Select {s.name} has no branches")
         last_val, dt = self.expr(branches[-1].value)
         dtype = dtype_name(dt)
-        out = self.emitter.regs.new("f" if is_float(dtype) else "r")
+        out = self.emitter.regs.new(reg_kind(dtype))
         self.emitter.ins(f"mov.{ptx_type(dtype)} {out}, {last_val};")
         self.values[s.name] = out
         self.value_dtypes[s.name] = dtype
@@ -1549,9 +1672,15 @@ class Compiler:
             scalar = bool(arg.get("scalar")) or len(arg.get("shape", [])) == 0
             pname = f"p_{sanitize(name)}"
             if scalar:
-                if is_float(dtype):
+                if dtype == "f32":
                     reg = self.emitter.regs.new("f")
                     self.emitter.ins(f"ld.param.f32 {reg}, [{pname}];")
+                elif dtype == "f64":
+                    reg = self.emitter.regs.new("d")
+                    self.emitter.ins(f"ld.param.f64 {reg}, [{pname}];")
+                elif dtype == "f16":
+                    reg = self.emitter.regs.new("h")
+                    self.emitter.ins(f"ld.param.b16 {reg}, [{pname}];")
                 else:
                     reg = self.emitter.regs.new("r")
                     self.emitter.ins(f"ld.param.s32 {reg}, [{pname}];")
