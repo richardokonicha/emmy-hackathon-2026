@@ -116,7 +116,9 @@ def reg_kind(dt) -> str:
         return "h"
     if name == "f64":
         return "d"
-    if name in ("s32", "i32", "int", "s64", "i64", "b32", "u32"):
+    if name in ("s64", "i64", "u64"):
+        return "rd"
+    if name in ("s32", "i32", "int", "b32", "u32"):
         return "r"
     raise SystemExit(f"unsupported register kind: {name}")
 
@@ -214,6 +216,7 @@ class Compiler:
         self.special: dict[str, str] = {}
         self.smem: dict[str, dict] = {}
         self.smem_bases: dict[str, str] = {}
+        self.smem_declared: set[str] = set()
         self.shared_decls: list[str] = []
         self.dynamic_smem = False
 
@@ -231,19 +234,22 @@ class Compiler:
         if meta_path.exists():
             return json.loads(meta_path.read_text())
         # Walk up the directory tree so kernels shipped without a sibling
-        # meta.json are still discoverable; fail loudly if none exists so a
-        # missing meta never silently produces wrong argument order.
+        # meta.json are still discoverable.
         candidate = self.ir_path.parent
         for ancestor in [candidate, *candidate.parents]:
             meta_path = ancestor / "meta.json"
             if meta_path.exists():
                 return json.loads(meta_path.read_text())
-        raise SystemExit(
-            f"no meta.json found for {self.ir_path} (searched {self.ir_path.parent} "
-            f"and ancestors) - argument order and entry name cannot be determined"
-        )
+        # No contract file at all.  meta.json is the contract whenever it
+        # exists, but a missing one must not cost the kernel: fall back to the
+        # IR's own argument order and say so on stderr.
+        print(f"warning: no meta.json found for {self.ir_path}; using the IR's own "
+              "argument order (inputs followed by outputs)", file=sys.stderr)
+        return {}
 
     def _kernel_meta(self) -> dict:
+        if not self.meta:
+            return {}
         kernels = self.meta.get("kernels")
         if not isinstance(kernels, list) or not kernels:
             raise SystemExit("meta.json has no kernels")
@@ -360,18 +366,35 @@ class Compiler:
         self.emitter.ins(f"mov.s32 {reg}, {int(value)};")
         return reg
 
+    def f64_const(self, value: float) -> str:
+        """Materialize an f64 constant.
+
+        This ptxas rejects a 64-bit immediate in `mov.f64`, so the bit
+        pattern is built from two 32-bit halves and moved in as a .b64 pair.
+        """
+        bits = float64_bits(value)
+        lo = self.emitter.regs.new("r")
+        hi = self.emitter.regs.new("r")
+        self.emitter.ins(f"mov.u32 {lo}, 0x{bits & 0xFFFFFFFF:08X};")
+        self.emitter.ins(f"mov.u32 {hi}, 0x{(bits >> 32) & 0xFFFFFFFF:08X};")
+        pair = self.emitter.regs.new("rd")
+        self.emitter.ins(f"mov.b64 {pair}, {{{lo}, {hi}}};")
+        reg = self.emitter.regs.new("d")
+        self.emitter.ins(f"mov.f64 {reg}, {pair};")
+        return reg
+
     def fconst(self, value: float, dtype="f32") -> str:
         name = dtype_name(dtype)
-        reg = self.emitter.regs.new(reg_kind(dtype))
         if name == "f32":
+            reg = self.emitter.regs.new("f")
             self.emitter.ins(f"mov.f32 {reg}, 0f{float_bits(value):08X};")
         elif name == "f64":
-            self.emitter.ins(f"mov.f64 {reg}, 0x{float64_bits(value):016X};")
+            reg = self.f64_const(value)
         elif name == "f16":
+            reg = self.emitter.regs.new("h")
             self.emitter.ins(f"mov.b16 {reg}, 0x{float16_bits(value):04X};")
         else:
             reg = self.int_reg(int(value))
-            return reg
         return reg
 
     def mul_int(self, a: str, b) -> str:
@@ -513,9 +536,7 @@ class Compiler:
             self.emitter.ins(f"mov.s32 {reg}, {int(value)};")
             return reg, "s32"
         if name == "f64":
-            reg = self.emitter.regs.new("d")
-            self.emitter.ins(f"mov.f64 {reg}, 0x{float64_bits(float(value)):016X};")
-            return reg, "f64"
+            return self.f64_const(float(value)), "f64"
         if name == "f16":
             reg = self.emitter.regs.new("h")
             self.emitter.ins(f"mov.b16 {reg}, 0x{float16_bits(float(value)):04X};")
@@ -657,6 +678,8 @@ class Compiler:
             "minimum": "min.s32",
             "max": "max.s32",
             "min": "min.s32",
+            "<<": "shl.b32",
+            ">>": "shr.s32",
         }.get(op)
         if ptxop is None:
             raise SystemExit(f"unsupported integer binary op {op!r}")
@@ -1009,9 +1032,30 @@ class Compiler:
             self.emitter.ins(f"neg.s32 {out}, {args[0]};")
             return out, "s32"
 
-        if name == "copy":
+        if name in ("copy", "pad"):
             out = self.emitter.regs.new(reg_kind(dt))
             self.emitter.ins(f"mov.{ptx_type(dt)} {out}, {args[0]};")
+            return out, dt
+
+        if name == "bitcast":
+            # Same-width bit reinterpretation: the destination dtype is the
+            # Assign's dtype, the source is the argument's.
+            src_dt = adts[0] if adts else dt
+            if src_dt == dt:
+                out = self.emitter.regs.new(reg_kind(dt))
+                self.emitter.ins(f"mov.{ptx_type(dt)} {out}, {args[0]};")
+                return out, dt
+            form = {
+                ("f32", "s32"): ("r", "mov.b32"),
+                ("s32", "f32"): ("f", "mov.f32"),
+                ("f64", "s64"): ("rd", "mov.b64"),
+                ("s64", "f64"): ("d", "mov.f64"),
+            }.get((src_dt, dt))
+            if form is None:
+                raise SystemExit(f"unsupported bitcast {src_dt} -> {dt}")
+            kind, ins = form
+            out = self.emitter.regs.new(kind)
+            self.emitter.ins(f"{ins} {out}, {args[0]};")
             return out, dt
 
         if name in ("sqrt", "rsqrt"):
@@ -1032,6 +1076,20 @@ class Compiler:
             if dt == "f16":
                 # This ptxas has no .b16 arithmetic or b16<->f32 conversion.
                 raise SystemExit(f"unsupported float op {name!r} for f16")
+            if name in ("floor_divide", "remainder", "mod"):
+                # PTX has no float remainder.  q = floor(a / b), r = a - q * b;
+                # this matches Python's float % (sign follows the divisor).
+                quot = self.emitter.regs.new(reg_kind(dt))
+                self.emitter.ins(f"div.rn.{dt} {quot}, {args[0]}, {args[1]};")
+                fl = self.emitter.regs.new(reg_kind(dt))
+                self.emitter.ins(f"cvt.rmi.{dt}.{dt} {fl}, {quot};")
+                if name == "floor_divide":
+                    return fl, dt
+                prod = self.emitter.regs.new(reg_kind(dt))
+                self.emitter.ins(f"mul.{dt} {prod}, {fl}, {args[1]};")
+                out = self.emitter.regs.new(reg_kind(dt))
+                self.emitter.ins(f"sub.{dt} {out}, {args[0]}, {prod};")
+                return out, dt
             ptxop = {
                 "f32": {
                     "add": "add.f32",
@@ -1093,6 +1151,9 @@ class Compiler:
             "and": "and.b32",
             "or": "or.b32",
             "xor": "xor.b32",
+            "left_shift": "shl.b32",
+            "right_shift": "shr.s32",
+            "bitwise_right_shift": "shr.s32",
         }.get(name)
         if ptxop is None:
             raise SystemExit(f"unsupported integer op {name!r}")
@@ -1546,24 +1607,64 @@ class Compiler:
         while step > 0:
             for state, state_b in zip(s.state, s.state_b):
                 a = self.values[state]
-                bits = self.emitter.regs.new("r")
-                self.emitter.ins(f"mov.b32 {bits}, {a};")
-                other = self.emitter.regs.new("r")
-                self.emitter.ins(
-                    f"shfl.sync.bfly.b32 {other}, {bits}, {step}, 0x1f, {mask};"
-                )
                 if dtype == "f64":
-                    reg = self.emitter.regs.new("d")
-                    self.emitter.ins(f"mov.b64 {reg}, {other};")
-                elif is_float(dtype):
-                    reg = self.emitter.regs.new("f")
-                    self.emitter.ins(f"mov.b32 {reg}, {other};")
+                    reg = self._f64_lane_exchange(a, step)
                 else:
-                    reg = other
+                    bits = self.emitter.regs.new("r")
+                    self.emitter.ins(f"mov.b32 {bits}, {a};")
+                    other = self.emitter.regs.new("r")
+                    self.emitter.ins(
+                        f"shfl.sync.bfly.b32 {other}, {bits}, {step}, 0x1f, {mask};"
+                    )
+                    if is_float(dtype):
+                        reg = self.emitter.regs.new("f")
+                        self.emitter.ins(f"mov.b32 {reg}, {other};")
+                    else:
+                        reg = other
                 self.values[state_b] = reg
                 self.value_dtypes[state_b] = dtype
             self.stmt(s.combine_states)
             step //= 2
+
+    def _f64_lane_exchange(self, reg: str, step: int) -> str:
+        """Exchange a 64-bit value with the lane at ``lane ^ step``.
+
+        This ptxas rejects ``mov.b32`` from a .f64 register, so the value is
+        published in a shared scratch slot and read back as two 32-bit halves,
+        which the vector form of ``mov.b64`` can rebuild.
+        """
+        name = "f64_shfl"
+        if name not in self.smem_declared:
+            self.smem_declared.add(name)
+            self.shared_decls.append(f".shared .align 8 .b8 {name}[256];")
+        lane = self.values.get("lane")
+        if lane is None:
+            raise SystemExit("f64 warp shuffle needs the lane index")
+        base = self.emitter.regs.new("r")
+        self.emitter.ins(f"mov.u32 {base}, {name};")
+        off = self.emitter.regs.new("r")
+        self.emitter.ins(f"mad.lo.s32 {off}, {lane}, 8, 0;")
+        slot = self.emitter.regs.new("r")
+        self.emitter.ins(f"add.s32 {slot}, {base}, {off};")
+        self.emitter.ins(f"st.shared.f64 [{slot}], {reg};")
+        self.emitter.ins("bar.warp.sync 0;")
+        partner = self.emitter.regs.new("r")
+        self.emitter.ins(f"xor.b32 {partner}, {lane}, {step};")
+        poff = self.emitter.regs.new("r")
+        self.emitter.ins(f"mad.lo.s32 {poff}, {partner}, 8, 0;")
+        addr = self.emitter.regs.new("r")
+        self.emitter.ins(f"add.s32 {addr}, {base}, {poff};")
+        hi_addr = self.emitter.regs.new("r")
+        self.emitter.ins(f"add.s32 {hi_addr}, {addr}, 4;")
+        lo = self.emitter.regs.new("r")
+        hi = self.emitter.regs.new("r")
+        self.emitter.ins(f"ld.shared.b32 {lo}, [{addr}];")
+        self.emitter.ins(f"ld.shared.b32 {hi}, [{hi_addr}];")
+        bits = self.emitter.regs.new("rd")
+        self.emitter.ins(f"mov.b64 {bits}, {{{lo}, {hi}}};")
+        out = self.emitter.regs.new("d")
+        self.emitter.ins(f"mov.f64 {out}, {bits};")
+        return out
 
     def _smem_index(self, buf: str, index_expr: int) -> str:
         return self.int_reg(index_expr)

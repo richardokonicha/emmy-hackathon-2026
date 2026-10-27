@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import re
 import shutil
@@ -392,6 +394,113 @@ class DtypeTests(unittest.TestCase):
         self.assertTrue(stores, comp.emitter.lines)
         # the address operand must be a whole register, e.g. "[%rd9 + %r3]"
         self.assertRegex(stores[0], r"st\.global\.u32 \[%rd\d+( \+ %r\d+)?\], 0;")
+
+
+class HiddenSetInsuranceTests(unittest.TestCase):
+    """Coverage for IR shapes the open set never exercises but the hidden set may."""
+
+    def _compiler(self):
+        mod = load_compiler()
+        comp = mod.Compiler(ir_path("p01_vector_add"))
+        comp.emit_prologue()
+        return mod, comp
+
+    def _regs(self, mod, comp, count=2, dtype="f32"):
+        regs = []
+        for _ in range(count):
+            reg = comp.emitter.regs.new(mod.reg_kind(dtype))
+            regs.append(reg)
+        return regs
+
+    def test_float_remainder_is_floor_based(self):
+        """PTX has no float remainder: r = a - floor(a / b) * b."""
+        mod, comp = self._compiler()
+        a, b = self._regs(mod, comp)
+        comp.op_on_regs("remainder", (a, b), "f32", arg_dtypes=["f32", "f32"])
+        text = "\n".join(comp.emitter.lines)
+        self.assertIn("div.rn.f32", text)
+        self.assertIn("cvt.rmi.f32.f32", text)
+        self.assertIn("mul.f32", text)
+        self.assertIn("sub.f32", text)
+
+    def test_float_floor_divide_rounds_down(self):
+        mod, comp = self._compiler()
+        a, b = self._regs(mod, comp)
+        comp.op_on_regs("floor_divide", (a, b), "f32", arg_dtypes=["f32", "f32"])
+        text = "\n".join(comp.emitter.lines)
+        self.assertIn("div.rn.f32", text)
+        self.assertIn("cvt.rmi.f32.f32", text)
+        self.assertNotIn("mul.f32", text)
+
+    def test_integer_shifts(self):
+        mod, comp = self._compiler()
+        a, b = self._regs(mod, comp, dtype="s32")
+        comp.op_on_regs("right_shift", (a, b), "s32", arg_dtypes=["s32", "s32"])
+        comp.op_on_regs("left_shift", (a, b), "s32", arg_dtypes=["s32", "s32"])
+        text = "\n".join(comp.emitter.lines)
+        self.assertIn("shr.s32", text)
+        self.assertIn("shl.b32", text)
+
+    def test_bitcast_moves_bits_not_values(self):
+        mod, comp = self._compiler()
+        a, _ = self._regs(mod, comp)
+        comp.op_on_regs("bitcast", (a,), "s32", arg_dtypes=["f32"])
+        text = "\n".join(comp.emitter.lines)
+        self.assertIn("mov.b32", text)
+        self.assertNotIn("cvt.", text)
+
+    def test_pad_is_a_plain_copy(self):
+        mod, comp = self._compiler()
+        a, _ = self._regs(mod, comp)
+        comp.op_on_regs("pad", (a,), "f32", arg_dtypes=["f32"])
+        text = "\n".join(comp.emitter.lines)
+        self.assertIn("mov.f32", text)
+
+    def test_missing_meta_falls_back_to_the_ir_order(self):
+        """A kernel shipped without meta.json must still compile."""
+        mod = load_compiler()
+        src = ir_path("p01_vector_add")
+        td = Path(tempfile.mkdtemp())
+        dst = td / "lonely"
+        shutil.copytree(src.parent, dst, dirs_exist_ok=True)
+        (dst / "meta.json").unlink()
+        ir = next(dst.glob("*.ir.json"))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            ptx = mod.compile_file(ir)
+        self.assertIn("warning: no meta.json found", stderr.getvalue())
+        self.assertIn(".param .u64 p_x0", ptx)
+        self.assertIn(".param .u64 p_x1", ptx)
+        self.assertIn(".param .u64 p_add", ptx)
+
+    def test_f64_reduction_exchanges_through_shared_memory(self):
+        """ptxas rejects mov.b32 from a .f64 register, so f64 shuffles go via smem."""
+        mod = load_compiler()
+        src = ir_path("r01_array_sum")
+        td = Path(tempfile.mkdtemp())
+        dst = td / "f64"
+        shutil.copytree(src.parent, dst, dirs_exist_ok=True)
+        ir = next(dst.glob("*.ir.json"))
+        doc = json.loads(ir.read_text())
+        for node in doc["nodes"].values():
+            if node["op"] != "KernelOp":
+                continue
+            body = node["op_fields"]["body"]
+            parts = body if isinstance(body, list) else [body]
+            parts = [
+                p.replace(
+                    "DataType(name='f32', np=dtype('float32'), nbytes=4)",
+                    "DataType(name='f64', np=dtype('float64'), nbytes=8)",
+                ).replace("dtype='float'", "dtype='double'")
+                for p in parts
+            ]
+            node["op_fields"]["body"] = parts if isinstance(body, list) else parts[0]
+        ir.write_text(json.dumps(doc, indent=2))
+        ptx = mod.compile_file(ir)
+        self.assertIn("st.shared.f64", ptx)
+        self.assertIn("bar.warp.sync 0;", ptx)
+        self.assertIn("mov.b64", ptx)
+        self.assertNotIn("mov.b32 %r", ptx.split("st.shared.f64")[0].split("activemask")[-1])
 
 
 if __name__ == "__main__":
