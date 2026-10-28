@@ -112,6 +112,7 @@ degrades loudly instead of silently:
 ```
 compile.py                 the compiler — the entire submission
 tests/test_compile.py      unit tests
+scripts/demo.sh            3-step walkthrough: meta.json -> PTX -> ptxas + reference check
 dev/run_all.py             compile + run the 15 open problems
 dev/run_extra.py           compile + run the 35 generated variants
 dev/bench.py               timed comparison against the organizers' hand-written PTX
@@ -132,6 +133,7 @@ pip install -r requirements.txt          # emmy-ml==0.3.11; numpy/requests are f
 
 python compile.py problems/r01_array_sum/k_sum_1_reduce.ir.json > out.ptx
 python submit.py r01_array_sum --compiler compile.py     # compile + run + check
+bash scripts/demo.sh                                    # the 3-step walkthrough used in the video
 python dev/run_all.py                                    # all 15 open problems
 python dev/run_extra.py                                  # all 35 generated variants
 python -m unittest discover -s tests -v                  # unit tests
