@@ -1,0 +1,75 @@
+{
+ "id": "z16_pow_f64",
+ "code": "torch.pow(torch.randn(64).double().abs() + 0.5, 3.0)",
+ "rtol": 1e-05,
+ "atol": 1e-05,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "pow_1"
+ ],
+ "kernels": [
+  {
+   "node": "pow_1",
+   "entry": "k_pow_1_pointwise",
+   "arg_order": [
+    "add_c1",
+    "pow_1_c1",
+    "x",
+    "pow_1"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "add_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      0.5
+     ]
+    },
+    {
+     "name": "pow_1_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      3.0
+     ]
+    },
+    {
+     "name": "x",
+     "dtype": "f64",
+     "shape": [
+      64
+     ],
+     "seed": 0
+    },
+    {
+     "name": "pow_1",
+     "dtype": "f32",
+     "shape": [
+      64
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

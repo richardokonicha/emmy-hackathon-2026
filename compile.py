@@ -88,6 +88,15 @@ def is_float(dt) -> bool:
     return dtype_name(dt).startswith("f")
 
 
+# Ops that always compute in f32: their result is f32 whatever the operand
+# was, so the operand is converted before the instruction is emitted.
+F32_ONLY_OPS = frozenset({
+    "exp", "exp_fast", "sign", "log", "log2", "log10", "softplus",
+    "sin", "cos", "tan", "pow", "relu", "sigmoid", "silu", "tanh",
+    "erf", "gelu", "gelu_tanh", "reciprocal", "sqrt", "rsqrt", "fma",
+})
+
+
 def ptx_type(dt) -> str:
     name = dtype_name(dt)
     if name == "f32":
@@ -192,6 +201,12 @@ class Compiler:
         self.raw = json.loads(self.ir_path.read_text())
         self.graph = Graph.from_dict(self.raw)
         self.kernel = self._find_kernel()
+        if getattr(self.kernel, "serial", None):
+            raise SystemExit(
+                "KernelOp.serial is not empty: serial axes are launched one "
+                "coordinate at a time with runtime integer parameters, which "
+                "this compiler does not implement"
+            )
         self.meta = self._find_meta()
         self.kmeta = self._kernel_meta()
         self.entry = self.kernel.name or self.kmeta.get("entry", self.kernel.name)
@@ -229,6 +244,20 @@ class Compiler:
                 return node.op
         raise SystemExit("no KernelOp found in IR")
 
+    def _meta_mentions_kernel(self, meta: dict) -> bool:
+        """True if ``meta`` plausibly describes this kernel.
+
+        An ancestor's meta.json is only adopted when it names this kernel (or
+        holds exactly one kernel), so a neighbouring problem's metadata can
+        never supply the wrong argument order.
+        """
+        kernels = meta.get("kernels")
+        if not isinstance(kernels, list) or not kernels:
+            return False
+        if len(kernels) == 1:
+            return True
+        return any(k.get("entry") == self.kernel.name for k in kernels)
+
     def _find_meta(self) -> dict:
         meta_path = self.ir_path.with_name("meta.json")
         if meta_path.exists():
@@ -239,7 +268,9 @@ class Compiler:
         for ancestor in [candidate, *candidate.parents]:
             meta_path = ancestor / "meta.json"
             if meta_path.exists():
-                return json.loads(meta_path.read_text())
+                meta = json.loads(meta_path.read_text())
+                if self._meta_mentions_kernel(meta):
+                    return meta
         # No contract file at all.  meta.json is the contract whenever it
         # exists, but a missing one must not cost the kernel: fall back to the
         # IR's own argument order and say so on stderr.
@@ -256,7 +287,13 @@ class Compiler:
         for k in kernels:
             if k.get("entry") == self.kernel.name:
                 return k
-        return kernels[0]
+        if len(kernels) == 1:
+            return kernels[0]
+        raise SystemExit(
+            f"kernel {self.kernel.name!r} is not listed in meta.json "
+            f"({', '.join(str(k.get('entry')) for k in kernels)}); its argument "
+            "order would be wrong"
+        )
 
     def shape_of(self, name: str):
         if name in self.smem:
@@ -405,6 +442,49 @@ class Compiler:
     def add_int(self, a: str, b) -> str:
         reg = self.emitter.regs.new("r")
         self.emitter.ins(f"add.s32 {reg}, {a}, {b};")
+        return reg
+
+    def _sdiv_const(self, a: str, c: int) -> str:
+        """a / c with C semantics, i.e. truncation toward zero."""
+        if c == 1:
+            return a
+        if c == 0:
+            reg = self.emitter.regs.new("r")
+            self.emitter.ins(f"div.s32 {reg}, {a}, {c};")
+            return reg
+        negate = c < 0
+        mag = -c if negate else c
+        if mag & (mag - 1) == 0:
+            # An arithmetic shift rounds toward -inf, so a negative dividend
+            # is biased up by (2**k - 1) first to get truncation.
+            sign = self.emitter.regs.new("r")
+            self.emitter.ins(f"shr.s32 {sign}, {a}, 31;")
+            mask = self.emitter.regs.new("r")
+            self.emitter.ins(f"and.b32 {mask}, {sign}, {mag - 1};")
+            adj = self.emitter.regs.new("r")
+            self.emitter.ins(f"add.s32 {adj}, {a}, {mask};")
+            q = self.emitter.regs.new("r")
+            self.emitter.ins(f"shr.s32 {q}, {adj}, {mag.bit_length() - 1};")
+            if negate:
+                nq = self.emitter.regs.new("r")
+                self.emitter.ins(f"neg.s32 {nq}, {q};")
+                return nq
+            return q
+        reg = self.emitter.regs.new("r")
+        self.emitter.ins(f"div.s32 {reg}, {a}, {c};")
+        return reg
+
+    def _srem_const(self, a: str, c: int) -> str:
+        """a % c with C semantics: the sign follows the dividend."""
+        if c == 0:
+            reg = self.emitter.regs.new("r")
+            self.emitter.ins(f"rem.s32 {reg}, {a}, {c};")
+            return reg
+        q = self._sdiv_const(a, c)
+        prod = self.emitter.regs.new("r")
+        self.emitter.ins(f"mul.lo.s32 {prod}, {q}, {c};")
+        reg = self.emitter.regs.new("r")
+        self.emitter.ins(f"sub.s32 {reg}, {a}, {prod};")
         return reg
 
     @staticmethod
@@ -573,6 +653,14 @@ class Compiler:
         raise SystemExit(f"unsupported expression {type(e).__name__}: {e!r}")
 
     def coerce(self, reg, dt, target):
+        """Convert ``reg`` from ``dt`` to ``target``; returns the new register.
+
+        The register is returned unchanged when no conversion is needed, so
+        callers can always use the result as a register of type ``target``.
+        Every conversion below was checked against the runner's ``ptxas``:
+        integer-to-integer uses ``cvt`` *without* a rounding modifier, which
+        this assembler rejects with "Illegal rounding modifier".
+        """
         dt = dtype_name(dt)
         target = dtype_name(target)
         if dt == "pred":
@@ -585,9 +673,21 @@ class Compiler:
             # This ptxas rejects ld/global.f16 and has no .b16<->.f32/.f64
             # conversion, so f16 cannot participate in arithmetic coercion.
             raise SystemExit(f"f16 coercion {dt} -> {target} is unsupported")
+        wide = dt in ("s64", "u64", "i64")
+        if wide and target in ("s32", "u32", "i32", "int"):
+            out = self.emitter.regs.new("r")
+            self.emitter.ins(f"cvt.s32.{dt} {out}, {reg};")
+            return out
+        if target in ("s64", "u64", "i64") and dt in ("s32", "u32", "i32", "int"):
+            out = self.emitter.regs.new("rd")
+            self.emitter.ins(f"cvt.{target}.s32 {out}, {reg};")
+            return out
         if is_float(target) and not is_float(dt):
             out = self.emitter.regs.new(reg_kind(target))
-            op = {"f32": "cvt.rn.f32.s32", "f64": "cvt.rn.f64.s32"}[target]
+            op = {
+                "f32": "cvt.rn.f32.s32" if not wide else "cvt.rn.f32.s64",
+                "f64": "cvt.rn.f64.s32" if not wide else "cvt.rn.f64.s64",
+            }[target]
             self.emitter.ins(f"{op} {out}, {reg};")
             return out
         if not is_float(target) and is_float(dt):
@@ -595,18 +695,29 @@ class Compiler:
             op = {"f32": "cvt.rzi.s32.f32", "f64": "cvt.rzi.s32.f64"}[dt]
             self.emitter.ins(f"{op} {out}, {reg};")
             return out
-        # float <-> float (f32 <-> f64)
+        # float <-> float (f32 <-> f64).  The table is keyed by the *source*
+        # type.  Widening f32 -> f64 is exact, so ptxas wants no rounding
+        # modifier there ("cvt.rn.f64.f32" is an "Illegal rounding modifier");
+        # narrowing f64 -> f32 needs one ("cvt.f32.f64" is a "Rounding
+        # modifier required").
         if is_float(dt) and is_float(target):
             out = self.emitter.regs.new(reg_kind(target))
-            op = {"f32": "cvt.rn.f32.f64", "f64": "cvt.rn.f64.f32"}[dt]
+            op = {"f32": "cvt.f64.f32", "f64": "cvt.rn.f32.f64"}[dt]
             self.emitter.ins(f"{op} {out}, {reg};")
             return out
         return reg
 
     def binary(self, e: BinaryExpr):
+        op = e.op
+        if op in ("/", "%") and isinstance(e.right, Literal) and isinstance(e.right.value, int):
+            c = int(e.right.value)
+            if c != 0:
+                a, adt = self.expr(e.left)
+                if not is_float(adt):
+                    reg = self._sdiv_const(a, c) if op == "/" else self._srem_const(a, c)
+                    return reg, "s32"
         a, adt = self.expr(e.left)
         b, bdt = self.expr(e.right)
-        op = e.op
 
         if op in ("==", "!=", "<", "<=", ">", ">="):
             target = "f64" if (adt == "f64" or bdt == "f64") else ("f32" if (is_float(adt) or is_float(bdt)) else "s32")
@@ -818,15 +929,120 @@ class Compiler:
         self.emitter.ins(f"@{p} mov.f32 {out}, {negp};")
         return out
 
+    def emit_pow_f32(self, x: str, y: str) -> str:
+        """x ** y, matching torch.pow for negative bases.
+
+        ``2 ** (y * log2(x))`` only covers x > 0.  A negative base with an
+        integral exponent takes the sign of x raised to y, and a negative base
+        with a fractional exponent is NaN, which is what torch.pow returns.
+        """
+        ax = self.emitter.regs.new("f")
+        self.emitter.ins(f"abs.f32 {ax}, {x};")
+        l2 = self._emit_lg2_f32(ax)
+        p = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {p}, {l2}, {y};")
+        mag = self.emitter.regs.new("f")
+        self.emitter.ins(f"ex2.approx.f32 {mag}, {p};")
+
+        # y is integral when y == floor(y)
+        yi = self.emitter.regs.new("f")
+        self.emitter.ins(f"cvt.rmi.f32.f32 {yi}, {y};")
+        p_int = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.eq.f32 {p_int}, {y}, {yi};")
+
+        # y is odd when y - 2 * floor(y / 2) == 1
+        half = self.emitter.regs.new("f")
+        self.emitter.ins(f"mul.f32 {half}, {y}, 0f3F000000;")
+        qh = self.emitter.regs.new("f")
+        self.emitter.ins(f"cvt.rmi.f32.f32 {qh}, {half};")
+        t = self.emitter.regs.new("f")
+        self.emitter.ins(f"fma.rn.f32 {t}, {qh}, 0fC0000000, {y};")
+        p_odd = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.eq.f32 {p_odd}, {t}, 0f3F800000;")
+
+        p_neg = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.lt.f32 {p_neg}, {x}, 0f00000000;")
+        p_signed = self.emitter.regs.new("p")
+        self.emitter.ins(f"and.pred {p_signed}, {p_neg}, {p_int};")
+        p_oddneg = self.emitter.regs.new("p")
+        self.emitter.ins(f"and.pred {p_oddneg}, {p_signed}, {p_odd};")
+
+        neg = self.emitter.regs.new("f")
+        self.emitter.ins(f"neg.f32 {neg}, {mag};")
+        signed = self.emitter.regs.new("f")
+        self.emitter.ins(f"selp.f32 {signed}, {neg}, {mag}, {p_oddneg};")
+
+        # a negative base with a fractional exponent is NaN
+        p_notint = self.emitter.regs.new("p")
+        self.emitter.ins(f"not.pred {p_notint}, {p_int};")
+        p_nan = self.emitter.regs.new("p")
+        self.emitter.ins(f"and.pred {p_nan}, {p_neg}, {p_notint};")
+        nan = self.emitter.regs.new("f")
+        self.emitter.ins(f"mov.f32 {nan}, 0f7FC00000;")
+        out = self.emitter.regs.new("f")
+        self.emitter.ins(f"selp.f32 {out}, {nan}, {signed}, {p_nan};")
+
+        # 0 ** 0 is 1
+        p_zero = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.eq.f32 {p_zero}, {ax}, 0f00000000;")
+        p_yzero = self.emitter.regs.new("p")
+        self.emitter.ins(f"setp.eq.f32 {p_yzero}, {y}, 0f00000000;")
+        p_00 = self.emitter.regs.new("p")
+        self.emitter.ins(f"and.pred {p_00}, {p_zero}, {p_yzero};")
+        one = self.emitter.regs.new("f")
+        self.emitter.ins(f"mov.f32 {one}, 0f3F800000;")
+        res = self.emitter.regs.new("f")
+        self.emitter.ins(f"selp.f32 {res}, {one}, {out}, {p_00};")
+        return res
+
+    @staticmethod
+    def arg_dtype(reg, dt=None):
+        """The dtype of an operand.
+
+        The IR knows it when the statement carried it; otherwise the register
+        name gives it away, since the compiler allocates one register class
+        per dtype.
+        """
+        if dt is not None:
+            return dtype_name(dt)
+        if reg.startswith("%f"):
+            return "f32"
+        if reg.startswith("%d"):
+            return "f64"
+        if reg.startswith("%h"):
+            return "f16"
+        if reg.startswith("%rd"):
+            return "s64"
+        if reg.startswith("%p"):
+            return "pred"
+        return "s32"
+
+    @staticmethod
+    def promoted_dtype(dtypes):
+        """The dtype a mixed-precision operation promotes to.
+
+        f64 wins over f32, f32 over the integer types -- the same rule
+        ``emmy``'s ``dtype_promote`` applies when it stamps an Assign.
+        """
+        if "f64" in dtypes:
+            return "f64"
+        if "f32" in dtypes:
+            return "f32"
+        return "s32"
+
     def op_on_regs(self, op, args, dtype="f32", dest=None, arg_dtypes=None):
         name = getattr(op, "name", str(op))
         dt = dtype_name(dtype)
         adts = list(arg_dtypes or [])
+        arg_dts = [self.arg_dtype(a, adts[i] if i < len(adts) else None)
+                   for i, a in enumerate(args)]
 
         if name in ("greater", "greater_equal", "less", "less_equal", "equal", "not_equal"):
             a, b = args
-            adt = adts[0] if adts else ("f32" if a.startswith("%f") else "s32")
-            kind = "f32" if is_float(adt) else "s32"
+            target = self.promoted_dtype(arg_dts)
+            a = self.coerce(a, arg_dts[0], target)
+            b = self.coerce(b, arg_dts[1], target)
+            kind = target
             cmp = {
                 "greater": "gt",
                 "greater_equal": "ge",
@@ -841,19 +1057,21 @@ class Compiler:
 
         if name == "where":
             cond, a, b = args
-            cdt = adts[0] if adts else None
+            cdt = arg_dts[0]
             if cdt != "pred":
                 p = self.emitter.regs.new("p")
-                kind = "f32" if cdt is not None and is_float(cdt) else "s32"
+                kind = "f32" if is_float(cdt) else "s32"
                 self.emitter.ins(f"setp.ne.{kind} {p}, {cond}, 0;")
                 cond = p
+            a = self.coerce(a, arg_dts[1], dt)
+            b = self.coerce(b, arg_dts[2], dt)
             out = self.emitter.regs.new(reg_kind(dt))
             self.emitter.ins(f"selp.{ptx_type(dt)} {out}, {a}, {b}, {cond};")
             return out, dt
 
         if name in ("negative", "neg"):
             a = args[0]
-            adt = adts[0] if adts else ("f32" if a.startswith("%f") else "s32")
+            adt = arg_dts[0]
             out = self.emitter.regs.new(reg_kind(adt))
             self.emitter.ins(f"neg.{ptx_type(adt)} {out}, {a};")
             return out, adt
@@ -861,7 +1079,7 @@ class Compiler:
         if name in ("logical_and", "logical_or", "logical_not"):
             if name == "logical_not":
                 a = args[0]
-                adt = adts[0] if adts else "s32"
+                adt = arg_dts[0]
                 out = self.emitter.regs.new("p")
                 if adt == "pred":
                     self.emitter.ins(f"not.pred {out}, {a};")
@@ -869,14 +1087,23 @@ class Compiler:
                     self.emitter.ins(f"setp.eq.{ptx_type(adt)} {out}, {a}, 0;")
                 return out, "pred"
             a, b = args
-            if adts[0] == "pred" and adts[1] == "pred":
+            if arg_dts[0] == "pred" and arg_dts[1] == "pred":
                 out = self.emitter.regs.new("p")
                 self.emitter.ins(f"{name.split('_')[1]}.pred {out}, {a}, {b};")
                 return out, "pred"
             out = self.emitter.regs.new("r")
             opc = name.split("_")[1]
+            a = self.coerce(a, arg_dts[0], "s32")
+            b = self.coerce(b, arg_dts[1], "s32")
             self.emitter.ins(f"{opc}.b32 {out}, {a}, {b};")
             return out, "s32"
+        # These ops are f32-only.  emmy promotes their *result* to f32 (the
+        # overflow guard in dtype_promote) but leaves the operands at their
+        # own precision, so an f64 operand has to be converted first or
+        # ptxas sees a type-mismatched instruction.
+        if name in F32_ONLY_OPS:
+            args = [self.coerce(a, adt, "f32") for a, adt in zip(args, arg_dts)]
+
         if name in ("exp", "exp_fast"):
             x = args[0]
             t = self.emitter.regs.new("f")
@@ -932,12 +1159,7 @@ class Compiler:
 
         if name == "pow":
             x, y = args
-            base = self._emit_lg2_f32(x)
-            p = self.emitter.regs.new("f")
-            self.emitter.ins(f"mul.f32 {p}, {base}, {y};")
-            out = self.emitter.regs.new("f")
-            self.emitter.ins(f"ex2.approx.f32 {out}, {p};")
-            return out, "f32"
+            return self.emit_pow_f32(x, y), "f32"
 
         if name == "relu":
             out = self.emitter.regs.new("f")
@@ -1074,8 +1296,13 @@ class Compiler:
 
         if is_float(dt):
             if dt == "f16":
-                # This ptxas has no .b16 arithmetic or b16<->f32 conversion.
+                # This ptxas has no .b16 arithmetic or b16<->.f32 conversion.
                 raise SystemExit(f"unsupported float op {name!r} for f16")
+            # The operands may carry a different precision than the result:
+            # emmy stamps the Assign with the promoted dtype but leaves the
+            # operands alone, so an f32 + f64 add has to widen the f32 side
+            # before ptxas sees it.
+            args = [self.coerce(a, adt, dt) for a, adt in zip(args, arg_dts)]
             if name in ("floor_divide", "remainder", "mod"):
                 # PTX has no float remainder.  q = floor(a / b), r = a - q * b;
                 # this matches Python's float % (sign follows the divisor).
@@ -1157,6 +1384,7 @@ class Compiler:
         }.get(name)
         if ptxop is None:
             raise SystemExit(f"unsupported integer op {name!r}")
+        args = [self.coerce(a, adt, "s32") for a, adt in zip(args, arg_dts)]
         out = dest or self.emitter.regs.new("r")
         self.emitter.ins(f"{ptxop} {out}, {args[0]}, {args[1]};")
         return out, "s32"
@@ -1393,7 +1621,8 @@ class Compiler:
         acc = self.values[s.name]
         a = self.values[s.base] if s.base else acc
         b = self.values[s.value]
-        reg, dt = self.op_on_regs(s.op, (a, b), dtype, dest=acc)
+        arg_dts = [self.value_dtypes.get(s.base or s.name), self.value_dtypes[s.value]]
+        reg, dt = self.op_on_regs(s.op, (a, b), dtype, dest=acc, arg_dtypes=arg_dts)
         self.values[s.name] = reg
         self.value_dtypes[s.name] = dt
 
@@ -1403,6 +1632,17 @@ class Compiler:
         if output is None:
             raise SystemExit(f"Write without output: {s!r}")
         dtype = dtype_name(s.value_dtype) if s.value_dtype is not None else dtype_name(self.dtype_of(output))
+        # The destination's dtype decides the memory layout, so a value that
+        # was computed at another precision is converted on the way out --
+        # this is what emmy's own renderer does.  The value's own dtype is
+        # used when the destination is unknown.
+        if output not in self.smem:
+            try:
+                buf_dtype = dtype_name(self.dtype_of(output))
+            except SystemExit:
+                buf_dtype = None
+            if buf_dtype is not None and buf_dtype != dtype:
+                dtype = buf_dtype
         index = tuple(s.index or ())
         w = len(values)
         aligned = self._flat_index_aligned(output, index, w) and self._size_divisible(output, w)
@@ -1432,6 +1672,9 @@ class Compiler:
                 idx[-1] = self.add_const_expr(idx[-1], k)
             flat = self.flatten(output, idx)
             reg = self.values[name]
+            value_dtype = self.value_dtypes.get(name)
+            if value_dtype is not None and value_dtype != dtype:
+                reg = self.coerce(reg, value_dtype, dtype)
             if output in self.smem:
                 addr = self.smem_elem_addr(output, flat)
                 self.emitter.ins(f"st.shared.{ptx_type(dtype)} [{addr}], {reg};")
@@ -1608,7 +1851,7 @@ class Compiler:
             for state, state_b in zip(s.state, s.state_b):
                 a = self.values[state]
                 if dtype == "f64":
-                    reg = self._f64_lane_exchange(a, step)
+                    reg = self._f64_lane_exchange(a, step, mask)
                 else:
                     bits = self.emitter.regs.new("r")
                     self.emitter.ins(f"mov.b32 {bits}, {a};")
@@ -1626,44 +1869,30 @@ class Compiler:
             self.stmt(s.combine_states)
             step //= 2
 
-    def _f64_lane_exchange(self, reg: str, step: int) -> str:
+    def _f64_lane_exchange(self, reg: str, step: int, mask: str) -> str:
         """Exchange a 64-bit value with the lane at ``lane ^ step``.
 
-        This ptxas rejects ``mov.b32`` from a .f64 register, so the value is
-        published in a shared scratch slot and read back as two 32-bit halves,
-        which the vector form of ``mov.b64`` can rebuild.
+        The value travels as two 32-bit halves through the register shuffle.
+        A shared-memory bounce cannot be used here: its slot index only knows
+        the lane, so two warps of the same block would overwrite each other's
+        value, and ptxas rejects ``mov.b32`` from a .f64 register.
         """
-        name = "f64_shfl"
-        if name not in self.smem_declared:
-            self.smem_declared.add(name)
-            self.shared_decls.append(f".shared .align 8 .b8 {name}[256];")
-        lane = self.values.get("lane")
-        if lane is None:
-            raise SystemExit("f64 warp shuffle needs the lane index")
-        base = self.emitter.regs.new("r")
-        self.emitter.ins(f"mov.u32 {base}, {name};")
-        off = self.emitter.regs.new("r")
-        self.emitter.ins(f"mad.lo.s32 {off}, {lane}, 8, 0;")
-        slot = self.emitter.regs.new("r")
-        self.emitter.ins(f"add.s32 {slot}, {base}, {off};")
-        self.emitter.ins(f"st.shared.f64 [{slot}], {reg};")
-        self.emitter.ins("bar.warp.sync 0;")
-        partner = self.emitter.regs.new("r")
-        self.emitter.ins(f"xor.b32 {partner}, {lane}, {step};")
-        poff = self.emitter.regs.new("r")
-        self.emitter.ins(f"mad.lo.s32 {poff}, {partner}, 8, 0;")
-        addr = self.emitter.regs.new("r")
-        self.emitter.ins(f"add.s32 {addr}, {base}, {poff};")
-        hi_addr = self.emitter.regs.new("r")
-        self.emitter.ins(f"add.s32 {hi_addr}, {addr}, 4;")
-        lo = self.emitter.regs.new("r")
-        hi = self.emitter.regs.new("r")
-        self.emitter.ins(f"ld.shared.b32 {lo}, [{addr}];")
-        self.emitter.ins(f"ld.shared.b32 {hi}, [{hi_addr}];")
         bits = self.emitter.regs.new("rd")
-        self.emitter.ins(f"mov.b64 {bits}, {{{lo}, {hi}}};")
+        self.emitter.ins(f"mov.b64 {bits}, {reg};")
+        lo = self.emitter.regs.new("r")
+        self.emitter.ins(f"cvt.u32.u64 {lo}, {bits};")
+        hi64 = self.emitter.regs.new("rd")
+        self.emitter.ins(f"shr.u64 {hi64}, {bits}, 32;")
+        hi = self.emitter.regs.new("r")
+        self.emitter.ins(f"cvt.u32.u64 {hi}, {hi64};")
+        lo2 = self.emitter.regs.new("r")
+        self.emitter.ins(f"shfl.sync.bfly.b32 {lo2}, {lo}, {step}, 0x1f, {mask};")
+        hi2 = self.emitter.regs.new("r")
+        self.emitter.ins(f"shfl.sync.bfly.b32 {hi2}, {hi}, {step}, 0x1f, {mask};")
+        pair = self.emitter.regs.new("rd")
+        self.emitter.ins(f"mov.b64 {pair}, {{{lo2}, {hi2}}};")
         out = self.emitter.regs.new("d")
-        self.emitter.ins(f"mov.f64 {out}, {bits};")
+        self.emitter.ins(f"mov.f64 {out}, {pair};")
         return out
 
     def _smem_index(self, buf: str, index_expr: int) -> str:
@@ -1679,15 +1908,29 @@ class Compiler:
         if len(bufs) == 1 and len(states) > 1:
             bufs = bufs * len(states)
 
+        # A segment-indexed tree (emmy's transposed ``coop-t`` combine) keeps
+        # ``length`` SEGMENTS of ``scale`` slots per slab: the slot is
+        # ``t*scale + iv`` and the broadcast root is ``iv`` -- the lane's own
+        # slot 0 inside its segment.  ``iv`` is a runtime value, not a
+        # component index: each state component has its own slab.
+        inner_reg = None
+        scale = 0
+        if inner is not None:
+            iv_name, scale = inner
+            scale = int(scale)
+            if iv_name not in self.values:
+                raise SystemExit(
+                    f"TreeHalve inner variable {iv_name!r} is not in scope"
+                )
+            inner_reg = self.values[iv_name]
+
         def slot_expr(component: int, plus: int):
             if inner is None:
                 return self.add_int(tid, plus) if plus else tid
-            _, scale = inner
-            base = self.mul_int(tid, int(scale))
+            base = self.mul_int(tid, scale)
+            base = self.add_int(base, inner_reg)
             if plus:
-                base = self.add_int(base, int(plus) * int(scale))
-            if component:
-                base = self.add_int(base, component)
+                base = self.add_int(base, plus * scale)
             return base
 
         step = int(s.length) // 2
@@ -1721,7 +1964,9 @@ class Compiler:
             step //= 2
 
         for comp, (buf, state) in enumerate(zip(bufs, states)):
-            root = self.int_reg(comp) if inner is not None else self.int_reg(0)
+            # the segment root is the lane's own slot 0 (``iv``), the flat
+            # tree's root is slot 0
+            root = inner_reg if inner is not None else self.int_reg(0)
             addr = self.smem_elem_addr(buf, root)
             reg = self.emitter.regs.new(reg_kind(dtype))
             self.emitter.ins(f"ld.shared.{ptx_type(dtype)} {reg}, [{addr}];")
@@ -1763,8 +2008,19 @@ class Compiler:
         self.emitter.ins(f"cp.async.wait_group {int(s.group)};")
 
     def stmt_setmaxnreg(self, s):
-        direction = str(s.direction)
-        self.emitter.ins(f"setmaxnreg.{direction}.sync.aligned.u32 {int(s.count)};")
+        """``SetMaxNReg`` is a register-budget hint, not a semantic operation.
+
+        It asks Hopper+ to move registers between the producer and consumer
+        halves of a warp-specialized kernel.  The instruction is unknown to
+        this runner's ``ptxas`` ("Not a name of any known instruction"), so
+        emitting it would turn a working kernel into a compile error.  The
+        statement is dropped; only the register/occupancy trade-off is lost.
+        """
+        print(
+            f"warning: ignoring SetMaxNReg({int(s.count)}, {s.direction!r}); "
+            "this ptxas cannot assemble setmaxnreg",
+            file=sys.stderr,
+        )
 
     def stmt_select(self, s):
         branches = list(s.branches)

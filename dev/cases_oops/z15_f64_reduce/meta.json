@@ -1,0 +1,53 @@
+{
+ "id": "z15_f64_reduce",
+ "code": "torch.randn(1024).double().sum()",
+ "rtol": 1e-06,
+ "atol": 1e-06,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "sum_1"
+ ],
+ "kernels": [
+  {
+   "node": "sum_1",
+   "entry": "k_sum_1_reduce",
+   "arg_order": [
+    "x",
+    "sum_1"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x",
+     "dtype": "f64",
+     "shape": [
+      1024
+     ],
+     "seed": 0
+    },
+    {
+     "name": "sum_1",
+     "dtype": "f64",
+     "shape": [
+      1
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

@@ -412,6 +412,50 @@ class HiddenSetInsuranceTests(unittest.TestCase):
             regs.append(reg)
         return regs
 
+    def test_float_coercion_widens_and_narrows_the_right_way(self):
+        """Widening f32->f64 takes no rounding modifier; narrowing needs one."""
+        mod, comp = self._compiler()
+        src = comp.emitter.regs.new("f")
+        wide = comp.coerce(src, "f32", "f64")
+        self.assertEqual(comp.emitter.lines[-1],
+                         f"        cvt.f64.f32 {wide}, {src};")
+        src64 = comp.emitter.regs.new("d")
+        narrow = comp.coerce(src64, "f64", "f32")
+        self.assertEqual(comp.emitter.lines[-1],
+                         f"        cvt.rn.f32.f64 {narrow}, {src64};")
+
+    def test_pow_keeps_the_sign_of_a_negative_base(self):
+        """torch.pow accepts a negative base when the exponent is an integer."""
+        mod = load_compiler()
+        ptx = mod.compile_file(dev_ir_path("z12_pow_neg"))
+        self.assertIn("setp.lt.f32", ptx)
+        self.assertIn("ex2.approx.f32", ptx)
+        self.assertIn("selp.f32", ptx)
+
+    def test_integer_division_by_a_literal_uses_a_shift(self):
+        """A power-of-two divisor becomes a shift instead of div.s32."""
+        mod, comp = self._compiler()
+        src = comp.emitter.regs.new("r")
+        comp._sdiv_const(src, 8)
+        self.assertIn("shr.s32", comp.emitter.lines[-1])
+        comp.emitter.lines.clear()
+        comp._srem_const(src, 8)
+        self.assertIn("sub.s32", comp.emitter.lines[-1])
+
+    def test_setmaxnreg_is_dropped_because_ptxas_cannot_assemble_it(self):
+        """setmaxnreg is a Hopper+ register hint; this runner's ptxas rejects it."""
+        mod, comp = self._compiler()
+
+        class _SetMaxNReg:
+            count = 40
+            direction = "inc"
+
+        before = len(comp.emitter.lines)
+        with contextlib.redirect_stderr(io.StringIO()):
+            comp.stmt_setmaxnreg(_SetMaxNReg())
+        self.assertEqual(len(comp.emitter.lines), before)
+        self.assertFalse(any("setmaxnreg" in line for line in comp.emitter.lines))
+
     def test_float_remainder_is_floor_based(self):
         """PTX has no float remainder: r = a - floor(a / b) * b."""
         mod, comp = self._compiler()
@@ -473,8 +517,84 @@ class HiddenSetInsuranceTests(unittest.TestCase):
         self.assertIn(".param .u64 p_x1", ptx)
         self.assertIn(".param .u64 p_add", ptx)
 
-    def test_f64_reduction_exchanges_through_shared_memory(self):
-        """ptxas rejects mov.b32 from a .f64 register, so f64 shuffles go via smem."""
+    def test_segment_indexed_tree_uses_the_inner_slot(self):
+        """emmy's segment tree indexes buf[t*scale + iv] and roots at buf[iv].
+
+        The flat tree (inner=None) is the only one the open problems reach,
+        so the segment arithmetic is pinned here: the slot must add the lane
+        register and the broadcast must read the lane's own slot.
+        """
+        mod = load_compiler()
+        ir = dev_ir_path("z17_segment_tree")
+        ptx = mod.compile_file(ir)
+
+        lane = re.search(r"and\.b32 (%r\d+), %r\d+, 31;", ptx)
+        self.assertIsNotNone(lane, "the lane register is not computed")
+        lane_reg = lane.group(1)
+        # the slot is warp*32 + lane, so the lane register must be added to a
+        # scaled product: once by the staging write and twice per tree step
+        # (the slot and its partner)
+        lane_adds = re.findall(rf"add\.s32 %r\d+, %r\d+, {re.escape(lane_reg)};", ptx)
+        self.assertGreaterEqual(len(lane_adds), 5, ptx)
+        # the broadcast root is the lane's own slot: lane*4 is the address
+        self.assertTrue(
+            re.search(rf"mul\.lo\.s32 %r\d+, {re.escape(lane_reg)}, 4;", ptx),
+            ptx,
+        )
+
+    def test_mixed_f32_f64_operands_are_converted(self):
+        """emmy stamps the Assign with the promoted dtype, not the operands'.
+
+        An f32 + f64 add has to widen the f32 side, otherwise ptxas sees a
+        type-mismatched instruction.
+        """
+        mod = load_compiler()
+        src = ir_path("p01_vector_add")
+        td = Path(tempfile.mkdtemp())
+        dst = td / "mix"
+        shutil.copytree(src.parent, dst, dirs_exist_ok=True)
+        ir = next(dst.glob("*.ir.json"))
+        doc = json.loads(ir.read_text())
+        f32 = "DataType(name='f32', np=dtype('float32'), nbytes=4)"
+        f64 = "DataType(name='f64', np=dtype('float64'), nbytes=8)"
+        for node in doc["nodes"].values():
+            if node["op"] != "KernelOp":
+                continue
+            body = node["op_fields"]["body"]
+            parts = body if isinstance(body, list) else [body]
+            out = []
+            for part in parts:
+                for tag in ("in1__u0", "in1__u1"):
+                    start = part.index(f"Load(names=('{tag}',)")
+                    marker = "), dtype="
+                    end = part.index(marker, start)
+                    part = (part[:end] + marker + f64
+                            + part[end + len(marker) + len(f32):])
+                part = part.replace(
+                    f"Assign(name='v0__u0', op=ElementwiseImpl('add'), "
+                    f"args=('in0__u0', 'in1__u0'), dtype={f32}",
+                    f"Assign(name='v0__u0', op=ElementwiseImpl('add'), "
+                    f"args=('in0__u0', 'in1__u0'), dtype={f64}")
+                out.append(part)
+            node["op_fields"]["body"] = out if isinstance(body, list) else out[0]
+        ir.write_text(json.dumps(doc, indent=2))
+
+        ptx = mod.compile_file(ir)
+        self.assertIn("cvt.f64.f32", ptx)
+        self.assertIn("add.f64", ptx)
+        self.assertIn("cvt.rn.f32.f64", ptx)
+        # the f64 result is narrowed again for the f32 destination
+        self.assertIn("st.global.f32", ptx)
+        self.assertNotIn("st.global.f64", ptx)
+        for line in ptx.splitlines():
+            self.assertNotIn("('", line)
+
+    def test_f64_reduction_shuffles_both_halves_in_registers(self):
+        """ptxas rejects mov.b32 from a .f64 register, so the value is split.
+
+        The two 32-bit halves travel through the register shuffle: a shared
+        memory bounce would race between the warps of one block.
+        """
         mod = load_compiler()
         src = ir_path("r01_array_sum")
         td = Path(tempfile.mkdtemp())
@@ -497,10 +617,12 @@ class HiddenSetInsuranceTests(unittest.TestCase):
             node["op_fields"]["body"] = parts if isinstance(body, list) else parts[0]
         ir.write_text(json.dumps(doc, indent=2))
         ptx = mod.compile_file(ir)
-        self.assertIn("st.shared.f64", ptx)
-        self.assertIn("bar.warp.sync 0;", ptx)
         self.assertIn("mov.b64", ptx)
-        self.assertNotIn("mov.b32 %r", ptx.split("st.shared.f64")[0].split("activemask")[-1])
+        self.assertIn("cvt.u32.u64", ptx)
+        self.assertIn("shr.u64", ptx)
+        self.assertEqual(ptx.count("shfl.sync.bfly.b32"), 10)
+        self.assertNotIn("bar.warp.sync 0;", ptx)
+        self.assertNotIn("f64_shfl", ptx)
 
 
 if __name__ == "__main__":

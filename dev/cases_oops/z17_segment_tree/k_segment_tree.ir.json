@@ -1,0 +1,46 @@
+{
+ "inputs": [
+  "x"
+ ],
+ "outputs": [
+  "sum"
+ ],
+ "nodes": {
+  "x": {
+   "op": "InputOp",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "x",
+     "shape": [
+      128
+     ],
+     "dtype": "f32"
+    }
+   ]
+  },
+  "sum": {
+   "op": "KernelOp",
+   "inputs": [
+    "x"
+   ],
+   "outputs": [
+    {
+     "name": "sum",
+     "shape": [
+      32
+     ],
+     "dtype": "f32"
+    }
+   ],
+   "op_fields": {
+    "body": [
+     "Tile(axes=(Axis(name='a0_co', extent=Dim(128), window=None),), body=(Load(names=('in0',), input='x', index=(Var(name='a0_co'),), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)),Smem(name='acc_smem', extents=(128,), dtype='float', align=0),Write(output='acc_smem', index=(BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='warp'), right=Literal(value=32, dtype='int')), right=Var(name='lane')),), values=('in0',), value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), atomic=False, swizzle='NONE'),Sync(barrier_id=0, count=None, warp=False),TreeHalve(bufs=('acc_smem',), state=('acc',), state_b=('acc__o',), combine_states=(Assign(name='acc', op=ElementwiseImpl('add'), args=('acc', 'acc__o'), dtype=None),), length=4, tid_var='warp', dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), barrier_id=0, barrier_count=None, inner=('lane', 32)),Cond(cond=BinaryExpr(op='==', left=Var(name='warp'), right=Literal(value=0, dtype='int')), body=(Write(output='sum', index=(Var(name='lane'),), values=('acc',), value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), atomic=False, swizzle='NONE'),), else_body=())), block_threads=128, aux_threads=0, raster_axes=None, raster_group=None, raster_orient='m')"
+    ],
+    "name": "k_segment_tree",
+    "zero_delegated": [],
+    "serial": []
+   }
+  }
+ }
+}
