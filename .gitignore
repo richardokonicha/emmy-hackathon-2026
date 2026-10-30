@@ -15,4 +15,11 @@ docs/plans/2026-10-26-hardening-plan.md
 docs/video-script.md
 docs/video-outline.md
 docs/video-script-3min.md
+docs/vo.md
+docs/vs.md
+docs/vs3.md
 scripts/publish_video.sh
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
